@@ -196,6 +196,8 @@ func codexTransportModeFromEnv() string {
 		return codexTransportModeStandard
 	case "utls", "utls_chrome", "chrome":
 		return codexTransportModeUTLSChrome
+	case "sidecar", "rustls", "egress":
+		return codexTransportModeSidecar
 	default:
 		return codexTransportModeStandard
 	}
@@ -266,6 +268,8 @@ func newCodexTransport(proxyURL string) http.RoundTripper {
 	switch codexTransportModeFromEnv() {
 	case codexTransportModeUTLSChrome:
 		return NewUTLSTransport(proxyURL)
+	case codexTransportModeSidecar:
+		return newCodexSidecarTransport(proxyURL)
 	default:
 		return newCodexStandardTransport(proxyURL)
 	}

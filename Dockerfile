@@ -16,7 +16,19 @@ COPY frontend/ .
 RUN VITE_APP_VERSION=${BUILD_VERSION} npm run build
 
 # ============================================================
-# Stage 2: 构建 Go 后端
+# Stage 2: 构建 Rust TLS sidecar (rustls 同源指纹出口)
+# 产物是静态 musl 二进制，随主进程同容器运行；体积优先
+# ============================================================
+FROM rust:1-alpine AS sidecar-builder
+
+WORKDIR /sidecar
+COPY sidecar/Cargo.toml sidecar/Cargo.lock* ./
+COPY sidecar/src ./src
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo build --release && cp target/release/codex-egress-sidecar /codex-egress-sidecar
+
+# ============================================================
+# Stage 3: 构建 Go 后端
 # 使用 BUILDPLATFORM 原生运行 + TARGETARCH 交叉编译
 # ============================================================
 FROM --platform=$BUILDPLATFORM golang:1.26.6-alpine AS go-builder
@@ -40,14 +52,17 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -ldflags="-s -w -X github.com/codex2api/internal/version.Version=${BUILD_VERSION}" -o /codex2api .
 
 # ============================================================
-# Stage 3: 最终运行镜像
+# Stage 4: 最终运行镜像
 # ============================================================
 FROM alpine:3.19
 
 RUN apk --no-cache add ca-certificates tzdata
 
 COPY --from=go-builder /codex2api /usr/local/bin/codex2api
+COPY --from=sidecar-builder /codex-egress-sidecar /usr/local/bin/codex-egress-sidecar
+COPY deploy/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
 EXPOSE 8080
 
-ENTRYPOINT ["/usr/local/bin/codex2api"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
