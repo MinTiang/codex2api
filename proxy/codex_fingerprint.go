@@ -55,6 +55,13 @@ type codexFingerprintIDs struct {
 	windowID       string
 }
 
+// saltedFingerprintSeed 把每部署随机盐拼进派生种子：同一开源项目的不同部署若共享
+// 同一映射，收敛身份会在上游视角聚类成同一群体；盐让每个部署的派生空间彼此独立。
+// 见 codex_fingerprint_salt.go。
+func saltedFingerprintSeed(seed string) string {
+	return CodexFingerprintSalt() + "\x00" + seed
+}
+
 // deriveStableCodexUUID 从种子确定性派生一个 UUIDv4 格式的字符串：同一种子恒定返回
 // 同一值，跨进程重启也不变，因此无需落库。
 //
@@ -62,7 +69,7 @@ type codexFingerprintIDs struct {
 // window 则是 v7（见 deriveStableCodexUUIDv7）。这里没有复用 uuid.NewSHA1（本仓库其它
 // 确定性 ID 的做法），因为那会产出 v5 UUID，版本位与真实 v4 不同，本身可被识别。
 func deriveStableCodexUUID(seed string) string {
-	sum := sha256.Sum256([]byte(seed))
+	sum := sha256.Sum256([]byte(saltedFingerprintSeed(seed)))
 	var u uuid.UUID
 	copy(u[:], sum[:16])
 	u[6] = (u[6] & 0x0f) | 0x40 // version 4
@@ -80,7 +87,7 @@ func deriveStableCodexUUID(seed string) string {
 // 伪随机的"时间戳位"落到与真实会话完全无关的位置、跳到序列顶部或底部（见 #536 评论）。
 // installation_id 真实是 v4，仍走 deriveStableCodexUUID。
 func deriveStableCodexUUIDv7(seed string, unixMilli int64) string {
-	sum := sha256.Sum256([]byte(seed))
+	sum := sha256.Sum256([]byte(saltedFingerprintSeed(seed)))
 	var u uuid.UUID
 	copy(u[:], sum[:16])
 	ms := uint64(unixMilli)
@@ -115,7 +122,7 @@ func codexIdentityUnixMilli(account *auth.Account, seed string) int64 {
 	if base <= 0 {
 		base = codexIdentityFallbackEpochMilli
 	}
-	sum := sha256.Sum256([]byte("codex2api:codex-identity-ts:v1:" + seed))
+	sum := sha256.Sum256([]byte(saltedFingerprintSeed("codex2api:codex-identity-ts:v1:" + seed)))
 	offset := int64(binary.BigEndian.Uint64(sum[:8]) % uint64(codexIdentitySpreadMilli))
 	return base + offset
 }
@@ -153,7 +160,7 @@ func NewUpstreamSessionUUID() string {
 // seededIdentityUnixMilli 是 codexIdentityUnixMilli 的无账号版本：拿不到账号加入
 // 时间时以固定基准代替，其余散布逻辑一致。
 func seededIdentityUnixMilli(seed string) int64 {
-	sum := sha256.Sum256([]byte("codex2api:session-identity-ts:v1:" + seed))
+	sum := sha256.Sum256([]byte(saltedFingerprintSeed("codex2api:session-identity-ts:v1:" + seed)))
 	offset := int64(binary.BigEndian.Uint64(sum[:8]) % uint64(codexIdentitySpreadMilli))
 	return codexIdentityFallbackEpochMilli + offset
 }

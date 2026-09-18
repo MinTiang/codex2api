@@ -478,6 +478,8 @@ func TestCodexTelemetryRecordTurnWithoutStateDoesNotPanic(t *testing.T) {
 
 func TestCodexTelemetryProfileIgnoresLocalAffinityKey(t *testing.T) {
 	profile := testCodexTelemetryProfile()
+	// 显式 off：本测试验证的是收敛关闭时身份回落链不碰亲和键。
+	profile.client.account.CodexFingerprintMode = auth.CodexFingerprintModeOff
 	headers := http.Header{}
 	headers.Set(downstreamAffinityHeader, "tenant-secret-42")
 	profile = buildCodexTelemetryProfile(profile.client, codexTelemetryRequest{account: profile.client.account, body: []byte(`{"model":"gpt-6-astra"}`), sessionID: "upstream-session", headers: headers})

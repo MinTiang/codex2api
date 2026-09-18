@@ -858,11 +858,11 @@ func TestApplyCodexRequestHeadersConvergesForwardedClientRequestID(t *testing.T)
 	if got := req.Header.Get("X-Client-Request-Id"); got != ids.threadID {
 		t.Fatalf("X-Client-Request-Id = %q, want converged thread id %q", got, ids.threadID)
 	}
-	// 出站会话键仍归 resolveUpstreamSessionID 管，收敛默认不得介入
-	// （对齐需显式开 CODEX_SESSION_HEADER_ALIGN_CONVERGED）。头名改成真实形态，
-	// 但取值语义不变。
-	if got := req.Header.Get("Session-Id"); got != "upstream-cache-key" {
-		t.Fatalf("Session-Id = %q, want the cache key untouched", got)
+	// session-id 头默认与收敛后的 metadata.session_id 对齐（真实客户端两处恒等，
+	// 各说各话是上游可直接比对的破绽）；prompt_cache_key 仍归
+	// resolveUpstreamSessionID 管，不受影响。
+	if got := req.Header.Get("Session-Id"); got != ids.sessionID {
+		t.Fatalf("Session-Id = %q, want converged session id %q", got, ids.sessionID)
 	}
 	// thread-id 与 x-client-request-id 必须同值：后者已被收敛改写，前者回落到
 	// 未收敛的值就自相矛盾。

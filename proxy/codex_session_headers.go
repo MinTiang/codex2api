@@ -46,25 +46,19 @@ func codexSessionHeaderModeFromEnv() string {
 // codexSessionHeaderAlignsConverged 报告是否让出站 session-id 头改用收敛后的会话
 // 身份，与 turn metadata / client_metadata 里的 session_id 对齐。
 //
-// 默认关，因为这会推翻本仓库一条既有的明确约束：出站会话键只归
-// resolveUpstreamSessionID 管，收敛不介入（见 codex_fingerprint.go 顶部说明与
-// auth/codex_fingerprint_mode.go）。那条约束保护的是 prompt cache 隔离——请求体的
-// prompt_cache_key 确实仍由 resolveUpstreamSessionID 独立决定、不受本开关影响，
-// 但上游是否**也**拿 session-id 头参与缓存分组，从客户端源码里看不出来。真要是
-// 参与了，开启后同账号下所有下游用户就共用一份缓存前缀，那是隐私和正确性问题，
-// 不是形状问题。
-//
-// 开启的收益：真实客户端的 session-id 头与 metadata.session_id 恒等
-// （core/src/client.rs 用同一个 session_id 填两处）。收敛只改 metadata 一侧，
-// 会让这两处各说各话，构成一个可比对的破绽——但这个比对需要上游主动关联
-// 头与体，成本远高于看一眼 UUID 版本位。所以默认留在安全的一侧，
-// 由部署者在确认上游缓存行为后显式打开。
+// 默认开。真实客户端的 session-id 头与 metadata.session_id 恒等（core/src/client.rs
+// 用同一个 session_id 填两处）；只收敛 metadata 一侧会让这两处各说各话，构成一个
+// 上游可直接比对的破绽。对齐后该破绽消失。既有约束（出站会话键只归
+// resolveUpstreamSessionID 管）仍然守住正确性底线：请求体的 prompt_cache_key
+// 不受本开关影响，缓存分组语义不变；唯一遗留风险是上游若拿 session-id 头参与
+// 缓存分组，收敛会话下的多下游用户会共享缓存前缀——这是部署者用隐私换存活的
+// 显式取舍。CODEX_SESSION_HEADER_ALIGN_CONVERGED=0/false/no/off 可整体回退。
 func codexSessionHeaderAlignsConverged() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_SESSION_HEADER_ALIGN_CONVERGED"))) {
-	case "1", "true", "yes", "y", "on":
-		return true
-	default:
+	case "0", "false", "no", "n", "off":
 		return false
+	default:
+		return true
 	}
 }
 

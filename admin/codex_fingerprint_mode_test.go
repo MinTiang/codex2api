@@ -60,13 +60,13 @@ func TestUpdateAccountSchedulerPersistsCodexFingerprintMode(t *testing.T) {
 		t.Fatalf("credential = %q, want %q", got, auth.CodexFingerprintModeSession)
 	}
 
-	// null 表示重置为默认档 off。
+	// null 表示清除账号显式档位，回落到部署默认档（内置 session）。
 	recorder = patchAccountScheduler(t, handler, accountID, `{"codex_fingerprint_mode":null}`)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("reset status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
 	}
-	if got := accountFingerprintCredential(t, db, accountID); got != auth.CodexFingerprintModeOff {
-		t.Fatalf("credential after reset = %q, want %q", got, auth.CodexFingerprintModeOff)
+	if got := accountFingerprintCredential(t, db, accountID); got != auth.DefaultCodexFingerprintMode() {
+		t.Fatalf("credential after reset = %q, want %q", got, auth.DefaultCodexFingerprintMode())
 	}
 }
 
@@ -101,8 +101,8 @@ func TestUpdateAccountSchedulerSyncsRuntimeCodexFingerprintMode(t *testing.T) {
 	if runtime == nil {
 		t.Fatal("runtime account not loaded")
 	}
-	if got := runtime.EffectiveCodexFingerprintMode(); got != auth.CodexFingerprintModeOff {
-		t.Fatalf("runtime mode = %q, want %q before any update", got, auth.CodexFingerprintModeOff)
+	if got := runtime.EffectiveCodexFingerprintMode(); got != auth.DefaultCodexFingerprintMode() {
+		t.Fatalf("runtime mode = %q, want %q before any update", got, auth.DefaultCodexFingerprintMode())
 	}
 
 	recorder := patchAccountScheduler(t, handler, accountID, `{"codex_fingerprint_mode":"device"}`)
@@ -241,9 +241,16 @@ func TestNewCodexAccountCredentialsStampsDefaultFingerprintMode(t *testing.T) {
 	handler := &Handler{db: db, store: store}
 	seed := tokenCredentialSeed{refreshToken: "rt-stamp"}
 
-	// 默认 off：不写入键，与升级前行为完全一致。
+	// 部署默认档（内置 session）会盖到新建账号的 credentials。
+	defaultMode := auth.DefaultCodexFingerprintMode()
+	if got := handler.newCodexAccountCredentials(seed)[auth.CodexFingerprintModeCredentialKey]; got != defaultMode {
+		t.Fatalf("credential = %v, want 默认档 %q", got, defaultMode)
+	}
+
+	// 显式 off 不写键：off 账号保持未盖章，升级后跟随部署默认档。
+	store.SetCodexFingerprintDefaultMode(auth.CodexFingerprintModeOff)
 	if _, ok := handler.newCodexAccountCredentials(seed)[auth.CodexFingerprintModeCredentialKey]; ok {
-		t.Fatal("默认 off 时不应写入 codex_fingerprint_mode 键")
+		t.Fatal("off 档不应写入 codex_fingerprint_mode 键")
 	}
 
 	store.SetCodexFingerprintDefaultMode(auth.CodexFingerprintModeSession)

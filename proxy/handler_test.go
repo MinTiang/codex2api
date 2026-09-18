@@ -1599,15 +1599,22 @@ func TestResponsesHTTPIngressFallsBackToHTTPWhenForcedWebsocketMessageTooBig(t *
 		t.Fatalf("HTTP fallback Lite header = %q, want true", got)
 	}
 	expectedUpstreamID := resolveUpstreamSessionID(0, sessionIdentity.upstreamSeed, sessionIdentity.explicitUpstreamID, false)
+	wsAccountID := <-wsAccountIDs
 	httpSessionID := <-httpSessionIDs
 	httpCacheKey := <-httpCacheKeys
-	if httpSessionID != expectedUpstreamID || httpCacheKey != expectedUpstreamID {
-		t.Fatalf("HTTP fallback upstream identity = header %q body %q, want header-independent seed %q", httpSessionID, httpCacheKey, expectedUpstreamID)
+	// prompt_cache_key 仍归网关会话键管；session-id 头按部署默认（收敛对齐）
+	// 使用租得账号的收敛身份，与 prompt_cache_key 分离属预期。
+	if httpCacheKey != expectedUpstreamID {
+		t.Fatalf("HTTP fallback cache key = %q, want header-independent seed %q", httpCacheKey, expectedUpstreamID)
+	}
+	leased := store.FindByID(int64(wsAccountID))
+	convergedSession, _ := ConvergedCodexSessionIdentity(leased, req.Header)
+	if convergedSession == "" || httpSessionID != convergedSession {
+		t.Fatalf("HTTP fallback session header = %q, want converged %q", httpSessionID, convergedSession)
 	}
 	if localAffinityID := resolveDownstreamAffinityID(req.Header); httpSessionID == localAffinityID || httpCacheKey == localAffinityID {
 		t.Fatalf("local affinity id leaked into HTTP fallback: local=%q header=%q body=%q", localAffinityID, httpSessionID, httpCacheKey)
 	}
-	wsAccountID := <-wsAccountIDs
 	httpAccountID := <-httpAccountIDs
 	if httpAccountID != fmt.Sprint(wsAccountID) {
 		t.Fatalf("HTTP fallback account = %q, want same leased WS account %d", httpAccountID, wsAccountID)

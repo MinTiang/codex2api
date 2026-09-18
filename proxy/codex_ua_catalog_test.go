@@ -83,11 +83,11 @@ func TestResolveCodexVersionPairDesktop(t *testing.T) {
 		floor         string
 		wantCLI, want string
 	}{
-		{"auto default is heaviest pair", "", "", "", "0.153.4", "26.901.51231"},
+		{"auto default is heaviest pair", "", "", "", "0.154.0", "26.903.71938"},
 		{"auto exact hit", "0.153.3", "", "", "0.153.3", "26.901.41123"},
 		{"auto unknown newer stays on nearest real pair", "0.153.5", "", "", "0.153.4", "26.901.51231"},
 		{"auto old version raised to smallest pair meeting floor", "0.152.0", "", "0.153.0", "0.153.0", "26.901.22334"},
-		{"auto floor above catalog uses floor with newest build", "", "", "0.160.0", "0.160.0", "26.901.51231"},
+		{"auto floor above catalog uses floor with newest build", "", "", "0.160.0", "0.160.0", "26.903.71938"},
 		{"explicit build untouched", "0.153.4", "26.901.41600", "", "0.153.4", "26.901.41600"},
 		{"explicit build re-paired when floor raises cli", "0.152.0", "26.831.20005", "0.153.0", "0.153.0", "26.901.22334"},
 		{"explicit build kept when floor above catalog", "0.152.0", "26.831.20005", "0.160.0", "0.160.0", "26.831.20005"},
@@ -123,7 +123,7 @@ func TestBuildCodexStructuredUserAgentByKind(t *testing.T) {
 		wantV  string
 	}{
 		{"desktop preset", `{"client_kind":"codex-desktop"}`,
-			"Codex Desktop/0.153.4 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.901.51231)", "0.153.4"},
+			"Codex Desktop/0.154.0 (Windows 10.0.26200; x86_64) unknown (Codex Desktop; 26.903.71938)", "0.154.0"},
 		{"vscode preset with cursor host", `{"client_kind":"codex-vscode","app_name":"Cursor"}`,
 			"codex_vscode/0.153.0 (Ubuntu 22.4.0; x86_64) unknown (Cursor; 26.901.22334)", "0.153.0"},
 		{"exec preset follows cli", `{"client_kind":"codex-exec"}`,
@@ -259,7 +259,7 @@ func TestPreviewCodexUserAgentConfig(t *testing.T) {
 	if preview.Mode != CodexUserAgentModeSingle || preview.Kind != string(CodexClientKindDesktop) || preview.Persona == nil {
 		t.Fatalf("unexpected preview shape: %+v", preview)
 	}
-	if preview.Persona.Originator != "Codex Desktop" || preview.Persona.Version != "0.153.4" {
+	if preview.Persona.Originator != "Codex Desktop" || preview.Persona.Version != "0.154.0" {
 		t.Fatalf("persona = %+v", preview.Persona)
 	}
 	if len(preview.Warnings) != 1 || preview.Warnings[0] != "terminal" {

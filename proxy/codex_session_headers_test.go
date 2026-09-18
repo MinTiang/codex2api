@@ -168,7 +168,7 @@ func TestApplyCodexSessionHeadersLegacyModeRestoresOldShape(t *testing.T) {
 	}
 }
 
-func TestApplyCodexSessionHeadersConvergedAlignmentIsOptIn(t *testing.T) {
+func TestApplyCodexSessionHeadersConvergedAlignmentIsDefault(t *testing.T) {
 	account := fingerprintAccount(t, auth.CodexFingerprintModeSession)
 	downstream := http.Header{}
 	downstream.Set("Session-Id", "01a00e75-8856-7542-89bf-35812620690f")
@@ -179,24 +179,23 @@ func TestApplyCodexSessionHeadersConvergedAlignmentIsOptIn(t *testing.T) {
 		t.Fatal("session 档未推导出收敛身份")
 	}
 
-	// 默认：出站会话键仍归 resolveUpstreamSessionID 管，收敛不介入——这是本仓库
-	// 既有约束，保护的是 prompt cache 隔离语义。
-	off := http.Header{}
-	ApplyCodexSessionHeaders(off, account, "gateway-cache-key", downstream, false)
-	if got := off.Get("Session-Id"); got != "gateway-cache-key" {
-		t.Fatalf("默认档 Session-Id = %q, want 网关会话键未被收敛覆盖", got)
-	}
-	// thread-id 不受该约束限制：这个头此前不存在，且必须与已收敛的
-	// x-client-request-id 同值。
-	if got := off.Get("Thread-Id"); got != convergedThreadID {
-		t.Fatalf("Thread-Id = %q, want converged %q", got, convergedThreadID)
-	}
-
-	// 显式开启后 session-id 与 metadata.session_id 对齐。
-	t.Setenv("CODEX_SESSION_HEADER_ALIGN_CONVERGED", "1")
+	// 默认对齐：session-id 头与 metadata.session_id 同值，与真实客户端一致。
 	on := http.Header{}
 	ApplyCodexSessionHeaders(on, account, "gateway-cache-key", downstream, false)
 	if got := on.Get("Session-Id"); got != convergedSessionID {
-		t.Fatalf("对齐开启后 Session-Id = %q, want converged %q", got, convergedSessionID)
+		t.Fatalf("默认档 Session-Id = %q, want converged %q", got, convergedSessionID)
+	}
+	// thread-id 不受会话键约束：这个头此前不存在，且必须与已收敛的
+	// x-client-request-id 同值。
+	if got := on.Get("Thread-Id"); got != convergedThreadID {
+		t.Fatalf("Thread-Id = %q, want converged %q", got, convergedThreadID)
+	}
+
+	// 显式退出后 session-id 回到网关会话键（旧行为），可整体回退对齐。
+	t.Setenv("CODEX_SESSION_HEADER_ALIGN_CONVERGED", "0")
+	off := http.Header{}
+	ApplyCodexSessionHeaders(off, account, "gateway-cache-key", downstream, false)
+	if got := off.Get("Session-Id"); got != "gateway-cache-key" {
+		t.Fatalf("显式退出后 Session-Id = %q, want 网关会话键", got)
 	}
 }

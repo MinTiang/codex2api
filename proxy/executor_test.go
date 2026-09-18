@@ -421,15 +421,20 @@ func TestApplyCodexRequestHeadersUsesSessionIDWithoutConversationID(t *testing.T
 		t.Fatalf("Authorization = %q", got)
 	}
 	// 真实客户端发 session-id / thread-id（连字符），不发下划线写法，也不发
-	// Conversation_id。单线程会话里 thread-id 与 session-id 同值。
-	if got := req.Header.Get("Session-Id"); got != "cache-key-1" {
-		t.Fatalf("Session-Id = %q", got)
+	// Conversation_id。单线程会话里 thread-id 与 session-id 同值。账号未显式配置
+	// 指纹档位时按部署默认（session）收敛，会话头与 metadata 同用收敛身份。
+	ids := resolveCodexFingerprintIDs(acc, downstreamHeaders)
+	if ids == nil {
+		t.Fatal("unconfigured account should converge under the deployment default")
 	}
-	if got := req.Header.Get("Thread-Id"); got != "cache-key-1" {
-		t.Fatalf("Thread-Id = %q, want 与 session 同值", got)
+	if got := req.Header.Get("Session-Id"); got != ids.sessionID {
+		t.Fatalf("Session-Id = %q, want converged %q", got, ids.sessionID)
 	}
-	if got := req.Header.Get("X-Client-Request-Id"); got != "cache-key-1" {
-		t.Fatalf("X-Client-Request-Id = %q, want 等于 thread id", got)
+	if got := req.Header.Get("Thread-Id"); got != ids.threadID {
+		t.Fatalf("Thread-Id = %q, want converged %q（与 session 同值）", got, ids.threadID)
+	}
+	if got := req.Header.Get("X-Client-Request-Id"); got != ids.threadID {
+		t.Fatalf("X-Client-Request-Id = %q, want 等于 thread id %q", got, ids.threadID)
 	}
 	if got := req.Header.Get("Session_id"); got != "" {
 		t.Fatalf("Session_id = %q, want empty（下划线写法不属于真实形态）", got)

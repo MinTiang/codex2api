@@ -76,16 +76,30 @@ func TestSubagentTransportLanesDoNotChangeUpstreamSessionOrPromptCache(t *testin
 
 	parentOutbound := executor.prepareWebsocketHeaders("token", account, account.AccountID, session, "api-key", nil, parentHeaders, parentBody)
 	childOutbound := executor.prepareWebsocketHeaders("token", account, account.AccountID, session, "api-key", nil, childHeaders, childBody)
+	// 账号未显式配置指纹档位时按部署默认（session）收敛：两条 lane 的 session-id
+	// 头收敛到同一个账号级会话身份（仍共享上游会话），thread-id 按下游线程
+	// 确定性派生、保持父子区分。
+	parentSession, parentThread := proxy.ConvergedCodexSessionIdentity(account, parentHeaders)
+	childSession, childThread := proxy.ConvergedCodexSessionIdentity(account, childHeaders)
+	if parentSession == "" || parentThread == "" || childThread == "" {
+		t.Fatal("部署默认档未推导出收敛身份")
+	}
+	if parentThread == childThread {
+		t.Fatal("converged thread ids collapsed across lanes")
+	}
+	if childSession != parentSession {
+		t.Fatalf("converged session differs across lanes: parent=%q child=%q", parentSession, childSession)
+	}
 	for name, headers := range map[string]http.Header{"parent": parentOutbound, "child": childOutbound} {
-		if got := headers.Get("Session-Id"); got != session {
-			t.Fatalf("%s outbound Session-Id = %q, want shared upstream session", name, got)
+		if got := headers.Get("Session-Id"); got != parentSession {
+			t.Fatalf("%s outbound Session-Id = %q, want shared converged session %q", name, got, parentSession)
 		}
 	}
-	if got := parentOutbound.Get("Thread-Id"); got != "parent-thread" {
-		t.Fatalf("parent outbound Thread-Id = %q", got)
+	if got := parentOutbound.Get("Thread-Id"); got != parentThread {
+		t.Fatalf("parent outbound Thread-Id = %q, want %q", got, parentThread)
 	}
-	if got := childOutbound.Get("Thread-Id"); got != "child-thread" {
-		t.Fatalf("child outbound Thread-Id = %q", got)
+	if got := childOutbound.Get("Thread-Id"); got != childThread {
+		t.Fatalf("child outbound Thread-Id = %q, want %q", got, childThread)
 	}
 }
 

@@ -2,9 +2,13 @@ package admin
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
+	"math/big"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -61,6 +65,16 @@ const (
 	// whamDailyUsageMinAccountAge 是自动刷新官方结算的最短账号年龄。
 	// 官方统计基本在账号产生请求后的次日才出数，导入当天拉上游只会空转。
 	whamDailyUsageMinAccountAge = 24 * time.Hour
+
+	// whamDailyUsageProbeJitterWindow 是按账号确定性错峰的窗口。所有账号若在同一
+	// 进程相位同时到期，探针会呈现「整批同时拉用量」的机器节奏；按账号 ID 派生
+	// 一个 0-20 分钟的偏移，把刷新时刻在间隔内摊开。确定性派生保证同一账号每次
+	// 进程重启后的相对相位稳定，不引入跨重启漂移。
+	whamDailyUsageProbeJitterWindow = 20 * time.Minute
+
+	// whamDailyUsageProbeDispatchStagger 是同一轮内每个账号拉取前的随机散布上限。
+	// 即使多个账号同轮到期，也要避免并发请求在同一秒整批打向上游。
+	whamDailyUsageProbeDispatchStagger = 45 * time.Second
 )
 
 var whamDailyUsageProbeOnce sync.Once
@@ -111,6 +125,21 @@ func whamDailyUsageProbeIntervalFor(account *auth.Account) time.Duration {
 	return whamDailyUsageProbeBaseInterval
 }
 
+// whamDailyUsageProbeJitterFor 为账号派生一个确定性的错峰偏移（0-20 分钟）。
+func whamDailyUsageProbeJitterFor(dbid int64) time.Duration {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("codex2api:wham-probe-jitter:v1:%d", dbid)))
+	return time.Duration(binary.BigEndian.Uint64(sum[:8]) % uint64(whamDailyUsageProbeJitterWindow))
+}
+
+// randomWhamDispatchDelay 返回单次拉取前的随机等待（0-45s），散布同轮批量的请求时刻。
+func randomWhamDispatchDelay() time.Duration {
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(whamDailyUsageProbeDispatchStagger)))
+	if err != nil || n == nil {
+		return 0
+	}
+	return time.Duration(n.Int64())
+}
+
 // whamDailyUsageDueTargets 从候选账号里挑出到期该刷的，并就地维护 lastAttempt
 // 计时表（记录本轮尝试、清掉已不存在的账号）。
 func whamDailyUsageDueTargets(all []*auth.Account, lastAttempt map[int64]time.Time, now time.Time) []*auth.Account {
@@ -120,7 +149,8 @@ func whamDailyUsageDueTargets(all []*auth.Account, lastAttempt map[int64]time.Ti
 		current[account.DBID] = struct{}{}
 		// 减去半个 tick 的裕量：不然 1h 间隔恰好落在 1h tick 边界上，
 		// 计时误差会让账号每次都差一点点到期、实际两小时才刷一次。
-		due := whamDailyUsageProbeIntervalFor(account) - whamDailyUsageProbeTick/2
+		// 叠加按账号的错峰偏移，避免整池账号在同一进程相位批量到期。
+		due := whamDailyUsageProbeIntervalFor(account) - whamDailyUsageProbeTick/2 + whamDailyUsageProbeJitterFor(account.DBID)
 		if last, ok := lastAttempt[account.DBID]; ok && now.Sub(last) < due {
 			continue
 		}
@@ -168,6 +198,13 @@ func (h *Handler) runWhamDailyUsageProbe(ctx context.Context, lastAttempt map[in
 				return
 			}
 			defer func() { <-sem }()
+
+			// 轮内随机散布：同轮到期的账号不在同一秒并发打上游。
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(randomWhamDispatchDelay()):
+			}
 
 			reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			defer cancel()

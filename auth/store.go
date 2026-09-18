@@ -4250,6 +4250,8 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	}
 	s.continuousRetryPolicy.Store(continuousPolicy)
 	s.codexFingerprintDefaultMode.Store(NormalizeCodexFingerprintMode(settings.CodexFingerprintDefaultMode))
+	// 同步部署级默认档：让未显式配置档位的存量账号跟随系统设置生效。
+	SetDeploymentCodexFingerprintDefaultMode(settings.CodexFingerprintDefaultMode)
 	s.githubToken.Store(strings.TrimSpace(settings.GithubToken))
 	s.githubProxyURL.Store(strings.TrimSpace(settings.GithubProxyURL))
 	s.SetModelCooldownSettings(database.ModelCooldownSettings{
@@ -8144,6 +8146,7 @@ func (s *Store) SetCodexFingerprintDefaultMode(mode string) {
 		return
 	}
 	s.codexFingerprintDefaultMode.Store(NormalizeCodexFingerprintMode(mode))
+	SetDeploymentCodexFingerprintDefaultMode(mode)
 }
 
 // GetCodexFingerprintDefaultMode 获取新导入账号的默认指纹收敛档位，缺省 off。

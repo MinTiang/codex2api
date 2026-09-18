@@ -63,11 +63,17 @@ func TestPrepareWebsocketHeadersUsesConfiguredDefaultsAndBetaFeatures(t *testing
 	}
 	// 握手会话头已改为真实客户端形态：build_websocket_headers 发 session-id /
 	// thread-id / x-client-request-id，不发下划线写法，也没有 Conversation_id。
-	if got := headers.Get("Session-Id"); got != "session-123" {
-		t.Fatalf("Session-Id = %q", got)
+	// 账号未显式配置指纹档位时按部署默认（session）收敛，会话头用收敛身份。
+	acc := &auth.Account{DBID: 42, AccountID: "42"}
+	convergedSession, convergedThread := proxy.ConvergedCodexSessionIdentity(acc, ginHeaders)
+	if convergedSession == "" || convergedThread == "" {
+		t.Fatal("部署默认档未推导出收敛身份")
 	}
-	if got := headers.Get("Thread-Id"); got != "session-123" {
-		t.Fatalf("Thread-Id = %q, want 与 session 同值", got)
+	if got := headers.Get("Session-Id"); got != convergedSession {
+		t.Fatalf("Session-Id = %q, want converged %q", got, convergedSession)
+	}
+	if got := headers.Get("Thread-Id"); got != convergedThread {
+		t.Fatalf("Thread-Id = %q, want converged %q", got, convergedThread)
 	}
 	if got := headers.Get("Conversation_id"); got != "" {
 		t.Fatalf("Conversation_id = %q, want empty", got)
@@ -170,11 +176,18 @@ func TestPrepareWebsocketHeadersSendsUserAgentByDefault(t *testing.T) {
 			t.Fatalf("%s = %q, want %q", name, got, ginHeaders.Get(name))
 		}
 	}
-	if got := headers.Get("Session-Id"); got != "session-123" {
-		t.Fatalf("Session-Id = %q", got)
+	// 会话头按部署默认（session 收敛）使用收敛身份；下游只报了 request-id，
+	// 没有会话/线程标识，thread-id 回落为与 session 同值。
+	acc := &auth.Account{DBID: 42, AccountID: "42"}
+	convergedSession, convergedThread := proxy.ConvergedCodexSessionIdentity(acc, ginHeaders)
+	if convergedSession == "" || convergedThread == "" {
+		t.Fatal("部署默认档未推导出收敛身份")
 	}
-	if got := headers.Get("Thread-Id"); got != "session-123" {
-		t.Fatalf("Thread-Id = %q, want 与 session 同值", got)
+	if got := headers.Get("Session-Id"); got != convergedSession {
+		t.Fatalf("Session-Id = %q, want converged %q", got, convergedSession)
+	}
+	if got := headers.Get("Thread-Id"); got != convergedThread {
+		t.Fatalf("Thread-Id = %q, want converged %q", got, convergedThread)
 	}
 	if got := headers.Get("Conversation_id"); got != "" {
 		t.Fatalf("Conversation_id = %q, want empty（真实握手头里没有这个头）", got)
@@ -603,10 +616,11 @@ func TestPrepareWebsocketHeadersConvergesForwardedClientRequestID(t *testing.T) 
 	} else if got == "" {
 		t.Fatal("X-Client-Request-Id was dropped, want a converged value")
 	}
-	// 握手的会话键归调用方决定，收敛默认不得介入（对齐需显式开
-	// CODEX_SESSION_HEADER_ALIGN_CONVERGED）。头名换成真实形态，取值语义不变。
-	if got := headers.Get("Session-Id"); got != "upstream-session-id" {
-		t.Fatalf("Session-Id = %q, want the caller value untouched", got)
+	// session-id 头默认与收敛后的 metadata.session_id 对齐（真实客户端两处恒等）；
+	// prompt_cache_key 仍归调用方会话键管，不受影响。
+	convergedSession, _ := proxy.ConvergedCodexSessionIdentity(account, ginHeaders)
+	if convergedSession == "" || headers.Get("Session-Id") != convergedSession {
+		t.Fatalf("Session-Id = %q, want converged %q", headers.Get("Session-Id"), convergedSession)
 	}
 	// thread-id 必须与已收敛的 x-client-request-id 同值，否则两个头各说各话。
 	if got, want := headers.Get("Thread-Id"), headers.Get("X-Client-Request-Id"); got != want {
