@@ -27,6 +27,72 @@ const (
 	MaxRetries    = 3
 )
 
+// PlatformClientID 是 platform.openai.com 官网 client（免接码授权流程使用）。
+// 用它签发的 refresh_token 必须以同一 client_id 刷新，否则 OpenAI 返回
+// 401 invalid_client（实测 2026-09-22）。硬编码 CLI ClientID 会导致
+// platform 号 AT 过期后无法续期（与 CLIProxyAPI PR #2153 同类问题）。
+const PlatformClientID = "app_2SKx67EdpoN0G6j64rFvigXD"
+
+// DetectClientIDFromToken 从 id_token/refresh_token 的 JWT 声明推断签发它的 client_id。
+// 兼容 platform（app_2SKx...）与 CLI（app_EMoam...）两种来源；解析失败返回空串。
+func DetectClientIDFromToken(tokens ...string) string {
+	for _, tok := range tokens {
+		tok = strings.TrimSpace(tok)
+		parts := strings.Split(tok, ".")
+		if len(parts) < 2 {
+			continue
+		}
+		payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+		if err != nil {
+			// 段可能带 padding，退一步用标准解码
+			payload, err = base64.URLEncoding.DecodeString(parts[1])
+			if err != nil {
+				continue
+			}
+		}
+		var claims struct {
+			Aud      any    `json:"aud"`
+			ClientID string `json:"client_id"`
+			Azp      string `json:"azp"`
+		}
+		if err := json.Unmarshal(payload, &claims); err != nil {
+			continue
+		}
+		// client_id / azp 优先
+		for _, c := range []string{claims.ClientID, claims.Azp} {
+			if strings.HasPrefix(c, "app_") {
+				return c
+			}
+		}
+		// aud 可能是字符串或数组
+		switch v := claims.Aud.(type) {
+		case string:
+			if strings.HasPrefix(v, "app_") {
+				return v
+			}
+		case []any:
+			for _, item := range v {
+				if s, ok := item.(string); ok && strings.HasPrefix(s, "app_") {
+					return s
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// ResolveRefreshClientID 决定刷新时使用的 client_id：
+// 1. 显式 override 优先；2. 从 token 声明探测；3. 回退默认 CLI ClientID。
+func ResolveRefreshClientID(refreshToken, idToken, override string) string {
+	if strings.TrimSpace(override) != "" {
+		return strings.TrimSpace(override)
+	}
+	if detected := DetectClientIDFromToken(idToken, refreshToken); detected != "" {
+		return detected
+	}
+	return ClientID
+}
+
 // ResinRequestDecorator 由外部（main.go）注入，用于在 Resin 启用时改写请求 URL 和添加 Header。
 // 避免 auth → proxy 循环依赖。参数: (originalURL, accountIdentifier) → (newURL)
 // 调用方需在返回的 req 上设置 X-Resin-Account header。
@@ -53,9 +119,17 @@ type AccountInfo struct {
 // RefreshAccessToken 用 RT 换取 AT
 // resinAccountID 可选，Resin 启用时传入账号标识用于粘性代理
 func RefreshAccessToken(ctx context.Context, refreshToken string, proxyURL string, resinAccountID ...string) (*TokenData, *AccountInfo, error) {
+	return RefreshAccessTokenWithClientID(ctx, refreshToken, "", "", proxyURL, resinAccountID...)
+}
+
+// RefreshAccessTokenWithClientID 与 RefreshAccessToken 相同，但允许显式指定 client_id / id_token。
+// clientIDOverride 为空时从 idToken/refreshToken 的 JWT 声明自动探测
+// （platform 签发的 RT 必须用 platform client 刷新，否则 401 invalid_client）。
+func RefreshAccessTokenWithClientID(ctx context.Context, refreshToken, idToken, clientIDOverride, proxyURL string, resinAccountID ...string) (*TokenData, *AccountInfo, error) {
+	clientID := ResolveRefreshClientID(refreshToken, idToken, clientIDOverride)
 	data := url.Values{
 		"grant_type":    {"refresh_token"},
-		"client_id":     {ClientID},
+		"client_id":     {clientID},
 		"refresh_token": {refreshToken},
 		"scope":         {RefreshScopes},
 	}
