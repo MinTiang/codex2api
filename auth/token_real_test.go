@@ -10,6 +10,10 @@ import (
 // TestRefreshRealPlatformToken 用真实 platform token 验证续期能力。
 // 需要 /tmp/real_rt.txt + /tmp/real_idt.txt（由 turb 测试产出），缺失则跳过。
 func TestRefreshRealPlatformToken(t *testing.T) {
+	// 需要真实 token 才跑(turb 测试产出); 环境变量守门避免 CI 误跑
+	if os.Getenv("RUN_REAL_TOKEN_TEST") != "1" {
+		t.Skip("未设置 RUN_REAL_TOKEN_TEST=1，跳过真实 token 测试")
+	}
 	rtBytes, err := os.ReadFile("/tmp/real_rt.txt")
 	if err != nil {
 		t.Skip("无真实 RT，跳过")
