@@ -240,21 +240,28 @@ func RefreshAccessTokenWithClientID(ctx context.Context, refreshToken, idToken, 
 	return td, info, nil
 }
 
-// RefreshWithRetry 带重试的 RT 刷新
-// resinAccountID 可选，Resin 启用时传入账号标识
-func RefreshWithRetry(ctx context.Context, refreshToken string, proxyURL string, resinAccountID ...string) (*TokenData, *AccountInfo, error) {
-	var lastErr error
-	for attempt := 0; attempt < MaxRetries; attempt++ {
-		if attempt > 0 {
-			backoff := time.Duration(1<<uint(attempt-1)) * time.Second
-			select {
-			case <-ctx.Done():
-				return nil, nil, ctx.Err()
-			case <-time.After(backoff):
+	// RefreshWithRetry 带重试的 RT 刷新
+	// resinAccountID 可选，Resin 启用时传入账号标识
+	func RefreshWithRetry(ctx context.Context, refreshToken string, proxyURL string, resinAccountID ...string) (*TokenData, *AccountInfo, error) {
+		return RefreshWithRetryClient(ctx, refreshToken, "", "", proxyURL, resinAccountID...)
+	}
+	
+	// RefreshWithRetryClient 与 RefreshWithRetry 相同，但保留签发 client。
+	// 接码授权（Codex CLI，app_EMoam...）可以不传；平台免接码授权（app_2SKx...）
+	// 必须传 idToken 或 clientID，否则刷新会 401 invalid_client。
+	func RefreshWithRetryClient(ctx context.Context, refreshToken, idToken, clientID, proxyURL string, resinAccountID ...string) (*TokenData, *AccountInfo, error) {
+		var lastErr error
+		for attempt := 0; attempt < MaxRetries; attempt++ {
+			if attempt > 0 {
+				backoff := time.Duration(1<<uint(attempt-1)) * time.Second
+				select {
+				case <-ctx.Done():
+					return nil, nil, ctx.Err()
+				case <-time.After(backoff):
+				}
 			}
-		}
-
-		td, info, err := RefreshAccessToken(ctx, refreshToken, proxyURL, resinAccountID...)
+	
+			td, info, err := RefreshAccessTokenWithClientID(ctx, refreshToken, idToken, clientID, proxyURL, resinAccountID...)
 		if err == nil {
 			return td, info, nil
 		}

@@ -53,9 +53,10 @@ func (s *Store) refreshCodexAccount(ctx context.Context, acc *Account, force boo
 		defer lease.Release()
 		break
 	}
-	acc.mu.RLock()
-	rt, st, oldAT, dbID, generation := strings.TrimSpace(acc.RefreshToken), acc.SessionToken, acc.AccessToken, acc.DBID, acc.CredentialGeneration
-	acc.mu.RUnlock()
+		acc.mu.RLock()
+		rt, st, oldAT, dbID, generation := strings.TrimSpace(acc.RefreshToken), acc.SessionToken, acc.AccessToken, acc.DBID, acc.CredentialGeneration
+		idToken, clientID := strings.TrimSpace(acc.IDToken), strings.TrimSpace(acc.OAuthClientID)
+		acc.mu.RUnlock()
 	if !force && s.tokenCache != nil {
 		cached, err := s.tokenCache.GetAccessToken(ctx, dbID)
 		if err != nil && s.tokenCache.SharedAcrossInstances() {
@@ -98,7 +99,7 @@ func (s *Store) refreshCodexAccount(ctx context.Context, acc *Account, force boo
 	var info *AccountInfo
 	var err error
 	if rt != "" {
-		td, info, err = RefreshWithRetry(ctx, rt, proxyURL, resinID)
+			td, info, err = RefreshWithRetryClient(ctx, rt, idToken, clientID, proxyURL, resinID)
 	} else {
 		err = fmt.Errorf("refresh_token 为空")
 	}

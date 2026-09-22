@@ -139,9 +139,14 @@ type Account struct {
 	grokRuntimeFactsMu   sync.Mutex
 	usageObservedAt      time.Time
 	DBID                 int64 // 数据库 ID
-	RefreshToken         string
-	SessionToken         string
-	AccessToken          string
+		RefreshToken         string
+		SessionToken         string
+		AccessToken          string
+		// IDToken 与 OAuthClientID 决定刷新 RT 时用哪个 OAuth client。
+		// 接码授权是 Codex CLI（app_EMoam...）；平台免接码授权是
+		// platform.openai.com（app_2SKx...）。空值保持旧行为，回退 CLI client。
+		IDToken       string
+		OAuthClientID string
 	ExpiresAt            time.Time
 	AccountID            string
 	Email                string
@@ -5659,6 +5664,11 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 			account.HealthTier = HealthTierHealthy
 		}
 	}
+
+	// 签发 client 与 id_token：刷新 RT 时用来区分接码授权（Codex CLI）与
+	// 平台免接码授权（platform.openai.com）。缺失时保持旧行为（回退 CLI client）。
+	account.IDToken = strings.TrimSpace(row.GetCredential("id_token"))
+	account.OAuthClientID = strings.TrimSpace(row.GetCredential(CodexOAuthClientIDCredentialKey))
 
 	// 尝试从 credentials 恢复已有的 AT
 	if at != "" {

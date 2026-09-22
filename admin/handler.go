@@ -4745,6 +4745,10 @@ type importToken struct {
 	name                  string
 	email                 string
 	idToken               string
+	// oauthClientID 是签发该账号 token 的 OAuth client（接码=Codex CLI，
+	// 平台免接码=platform.openai.com）。导入文件里带 client_id 时直接采用；
+	// 不带则按 id_token 的 JWT 声明反推。刷新 RT 时按它选 client。
+	oauthClientID         string
 	accountID             string
 	chatgptAccountID      string // sub2api 等导出格式中的 ChatGPT 账号唯一标识，用于精确去重
 	planType              string
@@ -4882,6 +4886,9 @@ type jsonAccountEntry struct {
 	AccessTokenCamel      string                 `json:"accessToken"`
 	IDToken               string                 `json:"id_token"`
 	IDTokenCamel          string                 `json:"idToken"`
+	// ClientID 是签发 token 的 OAuth client（turb 推送 platform 授权文件时携带）。
+	ClientID              string                 `json:"client_id"`
+	ClientIDCamel         string                 `json:"clientId"`
 	AccountID             string                 `json:"account_id"`
 	ChatGPTAccountID      string                 `json:"chatgpt_account_id"`
 	Email                 string                 `json:"email"`
@@ -4954,6 +4961,8 @@ type sub2apiAccountCredentials struct {
 	AccessTokenCamel      string                 `json:"accessToken"`
 	IDToken               string                 `json:"id_token"`
 	IDTokenCamel          string                 `json:"idToken"`
+	ClientID              string                 `json:"client_id"`
+	ClientIDCamel         string                 `json:"clientId"`
 	AccountID             string                 `json:"account_id"`
 	ChatGPTAccountID      string                 `json:"chatgpt_account_id"`
 	Email                 string                 `json:"email"`
@@ -5178,6 +5187,7 @@ func jsonAccountEntriesToTokens(entries []jsonAccountEntry) []importToken {
 				name:                  name,
 				email:                 email,
 				idToken:               idTok,
+				oauthClientID:         firstNonEmpty(entry.ClientID, entry.ClientIDCamel),
 				accountID:             strings.TrimSpace(entry.AccountID),
 				chatgptAccountID:      firstNonEmpty(entry.ChatGPTAccountID, accID),
 				planType:              planType,
@@ -5252,6 +5262,7 @@ func sub2apiAccountEntryToTokens(account sub2apiAccountEntry) []importToken {
 				name:                  name,
 				email:                 email,
 				idToken:               idTok,
+				oauthClientID:         firstNonEmpty(c.ClientID, c.ClientIDCamel),
 				accountID:             strings.TrimSpace(c.AccountID),
 				chatgptAccountID:      firstNonEmpty(c.ChatGPTAccountID, accID),
 				planType:              planType,
@@ -5360,6 +5371,7 @@ func importTokenSeed(t importToken, conflicts map[string]bool) tokenCredentialSe
 		sessionToken:          t.sessionToken,
 		accessToken:           t.accessToken,
 		idToken:               t.idToken,
+		oauthClientID:         t.oauthClientID,
 		accountID:             importStoredAccountID(t, conflicts),
 		email:                 t.email,
 		planType:              t.planType,

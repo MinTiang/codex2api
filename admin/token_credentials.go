@@ -18,6 +18,10 @@ type tokenCredentialSeed struct {
 	accessToken     string
 	accessTokenType string
 	idToken         string
+	// oauthClientID 记录签发 token 的 OAuth client（接码授权=Codex CLI，
+	// 平台免接码授权=platform.openai.com）。写入账号后，刷新 RT 时会用它，
+	// 避免平台号被当成接码号刷新而 401 invalid_client。
+	oauthClientID string
 	accountID       string
 	workspaceID     string
 	// userID 是 OpenAI 用户 ID（user-...），仅作为账号元数据保存。
@@ -45,6 +49,10 @@ func normalizeTokenCredentialSeed(seed tokenCredentialSeed) tokenCredentialSeed 
 	seed.accessToken = strings.TrimSpace(seed.accessToken)
 	seed.accessTokenType = strings.TrimSpace(seed.accessTokenType)
 	seed.idToken = strings.TrimSpace(seed.idToken)
+	// 导入文件里显式给的 client_id 优先；没给就按 id_token 声明反推。
+	if seed.oauthClientID = auth.NormalizeCodexOAuthClientID(seed.oauthClientID); seed.oauthClientID == "" {
+		seed.oauthClientID = auth.NormalizeCodexOAuthClientID(auth.DetectClientIDFromToken(seed.idToken))
+	}
 	seed.accountID = strings.TrimSpace(seed.accountID)
 	seed.workspaceID = openaiidentity.NormalizeWorkspaceID(seed.workspaceID)
 	seed.userID = strings.TrimSpace(seed.userID)
@@ -242,6 +250,9 @@ func tokenCredentialMap(seed tokenCredentialSeed) map[string]interface{} {
 	}
 	if seed.idToken != "" {
 		credentials["id_token"] = seed.idToken
+	}
+	if seed.oauthClientID != "" {
+		credentials[auth.CodexOAuthClientIDCredentialKey] = seed.oauthClientID
 	}
 	if !seed.expiresAt.IsZero() {
 		credentials["expires_at"] = seed.expiresAt.Format(time.RFC3339)
