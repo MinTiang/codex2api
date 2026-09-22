@@ -271,6 +271,9 @@ func applyCodexCredentialValues(acc *Account, credentials map[string]any, genera
 	acc.AccessToken = row.GetCredential("access_token")
 	acc.RefreshToken = row.GetCredential("refresh_token")
 	acc.SessionToken = row.GetCredential("session_token")
+	if idt := row.GetCredential("id_token"); idt != "" {
+		acc.IDToken = idt
+	}
 	acc.ExpiresAt = parseOAuthCredentialExpiry(row.GetCredential("expires_at"))
 	if plan := row.GetCredential("plan_type"); plan != "" {
 		acc.applyRefreshedPlanTypeLocked(plan, time.Now())

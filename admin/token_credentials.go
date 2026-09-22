@@ -337,6 +337,10 @@ func accountFromCredentialSeed(id int64, proxyURL string, seed tokenCredentialSe
 		RefreshToken:          seed.refreshToken,
 		SessionToken:          seed.sessionToken,
 		AccessToken:           seed.accessToken,
+		// IDToken/OAuthClientID 必须带上：导入后立即刷新走的就是这个内存对象，
+		// 缺了会退回 CLI client，platform 号 401 invalid_client（实测 2026-09-22）。
+		IDToken:               seed.idToken,
+		OAuthClientID:         seed.oauthClientID,
 		ExpiresAt:             seed.expiresAt,
 		AccountID:             seed.accountID,
 		Email:                 seed.email,
