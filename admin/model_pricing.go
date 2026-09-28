@@ -19,9 +19,11 @@ import (
 // modelVersionNumberRE 提取模型名中的数字段，用于版本排序（如 gpt-5.6-luna → 5,6）。
 var modelVersionNumberRE = regexp.MustCompile(`\d+`)
 
-// preferredBillingModelOrder 定价列表置顶顺序：gpt-6 astra → gpt-5.6 sol → terra → luna。
+// preferredBillingModelOrder 定价列表优先展示 GPT-6，再展示 GPT-5.6。
 var preferredBillingModelOrder = []string{
 	"gpt-6-astra",
+	"gpt-6-sol",
+	"gpt-6-luna",
 	"gpt-5.6-sol",
 	"gpt-5.6-terra",
 	"gpt-5.6-luna",
@@ -271,7 +273,7 @@ func (h *Handler) ListModelPricing(c *gin.Context) {
 		return modelPricingManagementKeys(ids)
 	}
 
-	keys := collect(proxy.SupportedModelIDs(ctx, h.db))
+	keys := collect(h.codexPricingModelIDs(ctx))
 	// Grok 模型不在 Codex 注册表里，但同样对外暴露、同样按 token 计费，
 	// 单独并进来，否则定价页看不到 grok-4.5 这类模型。
 	seen := make(map[string]struct{}, len(keys))

@@ -74,8 +74,8 @@ func TestSubagentTransportLanesDoNotChangeUpstreamSessionOrPromptCache(t *testin
 		}
 	}
 
-	parentOutbound := executor.prepareWebsocketHeaders("token", account, account.AccountID, session, "api-key", nil, parentHeaders, parentBody)
-	childOutbound := executor.prepareWebsocketHeaders("token", account, account.AccountID, session, "api-key", nil, childHeaders, childBody)
+	parentOutbound := executor.prepareWebsocketHeaders(context.Background(), "token", account, account.AccountID, session, "api-key", nil, parentHeaders, parentBody, "")
+	childOutbound := executor.prepareWebsocketHeaders(context.Background(), "token", account, account.AccountID, session, "api-key", nil, childHeaders, childBody, "")
 	// 账号未显式配置指纹档位时按部署默认（session）收敛：两条 lane 的 session-id
 	// 头收敛到同一个账号级会话身份（仍共享上游会话），thread-id 按下游线程
 	// 确定性派生、保持父子区分。

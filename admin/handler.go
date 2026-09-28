@@ -45,6 +45,7 @@ import (
 
 // Handler 管理后台 API 处理器
 type Handler struct {
+	imageQueue         *imageJobQueue
 	qualityTestContext context.Context
 	qualityTestWG      sync.WaitGroup
 	store              *auth.Store
@@ -72,6 +73,7 @@ type Handler struct {
 	activate5hWindow             func(context.Context, *auth.Account) error
 	executeUsageProbe            usageProbeRequestFunc
 	syncAccountPlanOnReset       func(context.Context, *auth.Account) error
+	queryResetUsage              func(context.Context, *auth.Account, string) (*proxy.WhamUsage, *http.Response, error)
 	queryResetCredits            func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
 	consumeResetCredit           func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
 	queryWhamDailyUsage          func(context.Context, *auth.Account, string, string, string) (*proxy.WhamDailyUsageResponse, *http.Response, error)
@@ -108,7 +110,11 @@ type Handler struct {
 	antigravitySyncAccount     func(context.Context, int64) antigravityRefreshItem
 	antigravityCapabilityProbe antigravityCapabilityExecutor
 	// Claude / Antigravity 渠道连通性测试配置的进程内缓存（首次读库，PUT 刷新）。
-	channelTestCfg atomic.Pointer[database.ChannelTestConfig]
+	channelTestCfg        atomic.Pointer[database.ChannelTestConfig]
+	channelMonitorWake    chan struct{}
+	channelMonitorSlots   chan struct{}
+	channelMonitorRunning sync.Map
+	channelMonitorID      string
 
 	// 导入触发的用量采样队列。固定数量 worker 消费任务，避免“一账号一 goroutine”
 	// 在大文件导入时堆出成千上万个阻塞协程。
@@ -165,21 +171,23 @@ type Handler struct {
 
 	// 「主动重置次数」消耗操作的工作区级互斥锁（workspace -> *sync.Mutex），
 	// 串行化同一上游工作区的并发重置，避免重复消耗与次数计数竞态。
-	resetCreditLocks          sync.Map
-	resetCreditLastSuccess    sync.Map
-	resetCreditSuccessfulIDs  sync.Map
-	autoResetCreditsWake      chan struct{}
-	autoResetCreditsStartOnce sync.Once
-	autoResetCreditsWG        sync.WaitGroup
-	autoActivate5hWake        chan struct{}
-	autoActivate5hStartOnce   sync.Once
-	autoActivate5hWG          sync.WaitGroup
-	resetCreditPostMu         sync.Mutex
-	resetCreditPostWG         sync.WaitGroup
-	resetCreditPostCtx        context.Context
-	resetCreditPostCancel     context.CancelFunc
-	resetCreditPostClosed     bool
-	settingsUpdateMu          sync.Mutex
+	resetCreditLocks               sync.Map
+	resetCreditLastSuccess         sync.Map
+	resetCreditSuccessfulIDs       sync.Map
+	autoResetCreditsWake           chan struct{}
+	codexTurnStateRenewalStartOnce sync.Once
+	codexTurnStateRenewalWG        sync.WaitGroup
+	autoResetCreditsStartOnce      sync.Once
+	autoResetCreditsWG             sync.WaitGroup
+	autoActivate5hWake             chan struct{}
+	autoActivate5hStartOnce        sync.Once
+	autoActivate5hWG               sync.WaitGroup
+	resetCreditPostMu              sync.Mutex
+	resetCreditPostWG              sync.WaitGroup
+	resetCreditPostCtx             context.Context
+	resetCreditPostCancel          context.CancelFunc
+	resetCreditPostClosed          bool
+	settingsUpdateMu               sync.Mutex
 
 	// 重复账号合并互斥锁：串行化 mergeRefreshedDuplicateIntoExisting，
 	// 防止并发导入同一身份的多个账号时互相合并、把双方都软删（账号丢失）。
@@ -338,6 +346,7 @@ func (h *Handler) probeImportedAccountUsage(ctx context.Context, accountID int64
 	if account.GetAccessToken() == "" && !account.IsCodexAgentIdentity() {
 		return
 	}
+	defer h.refreshImportedDaybreak(ctx, accountID)
 	probeFn := h.usageProbeFunc()
 	if probeFn == nil {
 		return
@@ -678,7 +687,7 @@ func (h *Handler) scheduleImportedAccountWarmup(acc *auth.Account, id int64, sou
 		h.triggerImportedAccountUsageProbe(id, source)
 		return
 	}
-	if h.store != nil && !h.store.GetLazyMode() {
+	if h.store != nil {
 		h.runImportProbeTask(func(ctx context.Context) {
 			h.refreshImportedAccountAndProbe(ctx, id, source+"_refresh")
 		})
@@ -693,6 +702,12 @@ func (h *Handler) commitImportedRuntimeAccounts(accounts []*auth.Account, source
 	}
 	h.store.AddAccounts(accounts)
 	if skipRefresh {
+		for _, account := range accounts {
+			if account != nil && account.GetAccessToken() != "" {
+				id := account.ID()
+				h.runImportProbeTask(func(ctx context.Context) { h.refreshImportedDaybreak(ctx, id) })
+			}
+		}
 		return
 	}
 	for _, acc := range accounts {
@@ -1027,6 +1042,9 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 		chartCacheData:       make(map[string]*chartCacheEntry),
 		accountListCache:     make(map[string]*accountListSnapshot),
 		accountAnalysisCache: make(map[string]*accountAnalysisCacheEntry),
+		channelMonitorWake:   make(chan struct{}, 1),
+		channelMonitorSlots:  make(chan struct{}, 4),
+		channelMonitorID:     fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano()),
 	}
 	if handler.imageProxy != nil {
 		handler.imageProxy.SetRuntimeCache(tc)
@@ -1048,8 +1066,10 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 	handler.autoActivate5hWake = make(chan struct{}, 1)
 	if db != nil {
 		handler.recordAccountEvent = db.InsertAccountEventAsync
-		if err := db.MarkInterruptedImageJobs(context.Background()); err != nil {
-			log.Printf("标记中断生图任务失败: %v", err)
+		if workers, _ := ImageJobWorkerCount(); workers == 0 {
+			if err := db.MarkInterruptedImageJobs(context.Background()); err != nil {
+				log.Printf("标记中断生图任务失败: %v", err)
+			}
 		}
 	}
 	return handler
@@ -1119,6 +1139,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/openai-responses/models", h.FetchOpenAIResponsesModels)
 	api.PATCH("/accounts/:id/openai-responses", h.UpdateOpenAIResponsesAccount)
 	api.GET("/accounts/:id/openai-responses/balance", h.GetOpenAIResponsesBalance)
+	api.GET("/accounts/:id/channel-monitor", h.GetChannelMonitorConfig)
+	api.PUT("/accounts/:id/channel-monitor", h.UpdateChannelMonitorConfig)
 	api.POST("/accounts/grok", h.AddGrokAccount)
 	api.POST("/accounts/grok/models", h.FetchGrokModels)
 	api.POST("/accounts/grok/batch-models", h.BatchUpdateGrokModels)
@@ -1167,6 +1189,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/:id/models/sync-upstream", h.SyncAccountUpstreamModels)
 	api.POST("/accounts/:id/models/probe", h.ProbeAccountModels)
 	api.PATCH("/accounts/:id/scheduler", h.UpdateAccountScheduler)
+	api.GET("/channel-monitors", h.ListChannelMonitors)
+	api.GET("/channel-monitors/billing-rates", h.ListChannelMonitorBillingRates)
+	api.POST("/channel-monitors/:id/probe", h.ProbeChannelMonitorNow)
 	api.DELETE("/accounts/:id", h.DeleteAccount)
 	api.GET("/accounts/health-bars", h.GetAccountHealthBars)
 	api.GET("/accounts/recycle-bin", h.ListRecycleBinAccounts)
@@ -1193,6 +1218,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts/invite/plan", h.GetInviteGuidePlan)
 	api.POST("/accounts/invite/plan/probe", h.ProbeInviteGuidePlan)
 	api.GET("/accounts/:id/test", h.TestConnection)
+	api.GET("/accounts/:id/model-detector", h.DetectCodexModel)
 	api.GET("/accounts/:id/quality-test/options", h.QualityTestOptions)
 	api.POST("/accounts/:id/quality-test", h.CreateQualityTestJob)
 	api.GET("/quality-tests", h.ListQualityTests)
@@ -1324,6 +1350,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/models/sync", h.SyncModels)
 	api.POST("/models/refresh-all", h.RefreshAllModels)
 	api.POST("/codex-cli-version/sync", h.SyncCodexCLIVersion)
+	api.POST("/codex-client-versions/sync", h.SyncCodexClientVersions)
 	api.GET("/model-pricing", h.ListModelPricing)
 	api.PUT("/model-pricing", h.UpdateModelPricing)
 	api.POST("/model-pricing/sync", h.SyncModelPricing)
@@ -1656,12 +1683,15 @@ type accountResponse struct {
 	GrokAPI                       bool                        `json:"grok_api,omitempty"`
 	AntigravityAPI                bool                        `json:"antigravity_api,omitempty"`
 	ClaudeAPI                     bool                        `json:"claude_api,omitempty"`
+	ExcelBPSEnabled               bool                        `json:"openai_excel_bps,omitempty"`
 	ClaudeAuthKind                string                      `json:"claude_auth_kind,omitempty"`
 	ClaudeBaseURL                 string                      `json:"claude_base_url,omitempty"`
 	AntigravityAuthKind           string                      `json:"antigravity_auth_kind,omitempty"`
 	AgentIdentity                 bool                        `json:"agent_identity,omitempty"`
 	GrokAuthKind                  string                      `json:"grok_auth_kind,omitempty"`
 	GrokPlan                      *auth.GrokPlan              `json:"grok_plan,omitempty"`
+	GrokPlanDisplay               *database.GrokPlanDisplay   `json:"grok_plan_display,omitempty"`
+	GrokModels                    *database.GrokModelSummary  `json:"grok_models,omitempty"`
 	GrokBilling                   json.RawMessage             `json:"grok_billing,omitempty"`
 	GrokRateLimit                 *auth.GrokRateLimitSnapshot `json:"grok_rate_limit,omitempty"`
 	GrokFreeQuota                 *auth.GrokFreeQuotaSnapshot `json:"grok_free_quota,omitempty"`
@@ -1677,6 +1707,7 @@ type accountResponse struct {
 	ModelMapping                  string                      `json:"model_mapping,omitempty"`
 	CodexClientMetadataMode       string                      `json:"codex_client_metadata_mode,omitempty"`
 	CodexPassthroughMode          string                      `json:"codex_passthrough_mode,omitempty"`
+	ResponsesUpstreamTransport    string                      `json:"responses_upstream_transport,omitempty"`
 	CodexFingerprintMode          string                      `json:"codex_fingerprint_mode,omitempty"`
 	ClaudeFingerprintMode         string                      `json:"claude_fingerprint_mode,omitempty"`
 	ClaudeUserAgent               string                      `json:"claude_user_agent,omitempty"`
@@ -1687,9 +1718,6 @@ type accountResponse struct {
 	ClaudeVersionPolicyOverride   string                      `json:"claude_version_policy_override,omitempty"`
 	ClaudeClientVersionOverride   string                      `json:"claude_client_version_override,omitempty"`
 	Timezone                      string                      `json:"timezone,omitempty"`
-	CodexTurnState                string                      `json:"codex_turn_state,omitempty"`
-	CodexTurnStateModels          string                      `json:"codex_turn_state_models,omitempty"`
-	CodexTurnStateSetAt           string                      `json:"codex_turn_state_set_at,omitempty"`
 	CustomHeaders                 map[string]string           `json:"custom_headers,omitempty"`
 	HealthTier                    string                      `json:"health_tier"`
 	SchedulerScore                float64                     `json:"scheduler_score"`
@@ -1723,6 +1751,9 @@ type accountResponse struct {
 	UsagePercent5h                *float64                    `json:"usage_percent_5h"`
 	UsagePercentSpark             *float64                    `json:"usage_percent_spark"`
 	RateLimitResetCredits         *int                        `json:"rate_limit_reset_credits"`
+	DaybreakSupported             bool                        `json:"daybreak_supported"`
+	DaybreakModels                map[string][]string         `json:"daybreak_models,omitempty"`
+	DaybreakCheckedAt             int64                       `json:"daybreak_checked_at,omitempty"`
 	ApplicableResetCredits        *int                        `json:"applicable_reset_credits"`
 	CreditsValid                  bool                        `json:"credits_valid"`
 	CreditsBalance                *string                     `json:"credits_balance"`
@@ -1886,6 +1917,11 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		return
 	}
 
+	if err := h.db.HydrateGrokDisplay(ctx, rows); err != nil {
+		writeInternalError(c, err)
+		return
+	}
+
 	// 合并内存中的调度指标
 	accountMap := make(map[int64]*auth.Account)
 	if view == "page" {
@@ -2023,6 +2059,10 @@ func (h *Handler) GetAccount(c *gin.Context) {
 		usage7d = make(map[int64]*database.AccountTimeRangeUsage)
 	}
 
+	if err := h.db.HydrateGrokDisplay(ctx, []*database.AccountRow{row}); err != nil {
+		writeInternalError(c, err)
+		return
+	}
 	runtimeAccount := h.store.FindByID(id)
 	resp := h.buildAccountResponse(row, runtimeAccount, requestCounts[id], usage5h[id], usage7d[id], true)
 	if runtimeAccount != nil {
@@ -2062,6 +2102,7 @@ type accountLiteResponse struct {
 	OpenAIResponsesAPI bool   `json:"openai_responses_api"`
 	GrokAPI            bool   `json:"grok_api"`
 	ClaudeAPI          bool   `json:"claude_api"`
+	ExcelBPSEnabled    bool   `json:"openai_excel_bps"`
 	AgentIdentity      bool   `json:"agent_identity"`
 	GrokAuthKind       string `json:"grok_auth_kind,omitempty"`
 }
@@ -2118,6 +2159,7 @@ func (h *Handler) listAccountsLite(c *gin.Context, ctx context.Context) {
 			OpenAIResponsesAPI: isOpenAIResponsesAccount,
 			GrokAPI:            isGrokAccount,
 			ClaudeAPI:          isClaudeAccount,
+			ExcelBPSEnabled:    row.GetCredentialBool(auth.ExcelBPSCredentialKey),
 			AgentIdentity:      isAgentIdentityCredentialRow(row),
 			GrokAuthKind:       grokAuthKind,
 		})
@@ -2148,8 +2190,7 @@ type updateAccountSchedulerReq struct {
 	ClaudeVersionPolicy     json.RawMessage `json:"claude_version_policy"`
 	ClaudeClientVersion     json.RawMessage `json:"claude_client_version"`
 	Timezone                json.RawMessage `json:"timezone"`
-	CodexTurnState          json.RawMessage `json:"codex_turn_state"`
-	CodexTurnStateModels    json.RawMessage `json:"codex_turn_state_models"`
+	ExcelBPSEnabled         json.RawMessage `json:"openai_excel_bps"`
 }
 
 type accountSchedulerUpdate struct {
@@ -2174,8 +2215,7 @@ type accountSchedulerUpdate struct {
 	ClaudeVersionPolicy     database.OptionalString
 	ClaudeClientVersion     database.OptionalString
 	Timezone                database.OptionalString
-	CodexTurnState          database.OptionalString
-	CodexTurnStateModels    database.OptionalString
+	ExcelBPSEnabled         database.OptionalBool
 	CredentialUpdates       map[string]interface{}
 }
 
@@ -2282,18 +2322,13 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
-	codexTurnStateField, err := parseOptionalStringField(req.CodexTurnState, "codex_turn_state", auth.ValidateCodexTurnState)
+	excelBPSEnabled, err := parseOptionalBoolField(req.ExcelBPSEnabled, "openai_excel_bps")
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
-	codexTurnStateModelsField, err := parseOptionalStringField(req.CodexTurnStateModels, "codex_turn_state_models", auth.ValidateCodexTurnStateModels)
-	if err != nil {
-		return accountSchedulerUpdate{}, err
-	}
-	if codexTurnStateModelsField.Set {
-		codexTurnStateModelsField.Value = auth.NormalizeCodexTurnStateModels(codexTurnStateModelsField.Value)
-	}
-	if codexFingerprintMode.Set {
+	if codexFingerprintMode.Set && codexFingerprintMode.Value != "" {
+		// 空值(null 重置)保持空串落库：清除显式档位，运行时动态跟随部署默认档；
+		// 非空取值在这里归一化。
 		codexFingerprintMode.Value = auth.NormalizeCodexFingerprintMode(codexFingerprintMode.Value)
 	}
 	requestIDHeader, err := parseOptionalStringField(req.UpstreamRequestIDHeader, "upstream_request_id_header", auth.ValidateUpstreamRequestIDHeader)
@@ -2325,18 +2360,8 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	if timezoneField.Set {
 		credentialUpdates[auth.AccountTimezoneCredentialKey] = strings.TrimSpace(timezoneField.Value)
 	}
-	if codexTurnStateField.Set {
-		credentialUpdates[auth.CodexTurnStateCredentialKey] = codexTurnStateField.Value
-		// 时效起点默认随值一起刷新（批量接口拿不到逐账号旧值，只能按"换了新值"处理）；
-		// 单账号接口在值未变且已有起点时保留旧起点，见 refineCodexTurnStateSetAt。
-		setAt := ""
-		if codexTurnStateField.Value != "" {
-			setAt = time.Now().UTC().Format(time.RFC3339)
-		}
-		credentialUpdates[auth.CodexTurnStateSetAtCredentialKey] = setAt
-	}
-	if codexTurnStateModelsField.Set {
-		credentialUpdates[auth.CodexTurnStateModelsCredentialKey] = codexTurnStateModelsField.Value
+	if excelBPSEnabled.Set {
+		credentialUpdates[auth.ExcelBPSCredentialKey] = excelBPSEnabled.Value
 	}
 	if autoPause5hThreshold.Set {
 		credentialUpdates["auto_pause_5h_threshold"] = autoPause5hThreshold.Value
@@ -2397,8 +2422,7 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		ClaudeVersionPolicy:     claudeVersionPolicy,
 		ClaudeClientVersion:     claudeClientVersion,
 		Timezone:                timezoneField,
-		CodexTurnState:          codexTurnStateField,
-		CodexTurnStateModels:    codexTurnStateModelsField,
+		ExcelBPSEnabled:         excelBPSEnabled,
 		CredentialUpdates:       credentialUpdates,
 	}, nil
 }
@@ -2455,27 +2479,11 @@ func validateCodexFingerprintMode(value string) error {
 	if value == "" || auth.IsValidCodexFingerprintMode(value) {
 		return nil
 	}
-	return errors.New("必须是 off、device、session 或 full")
-}
-
-// refineCodexTurnStateSetAt 让时效起点只在注入值真正换掉时重置：原样重提同一个值不
-// 重置（它还是上游那时候签发的那一个 state）；存量行没有起点时补一次，让倒计时能从
-// 这一刻开始走，而不是逼用户先清空再粘贴一遍。
-func refineCodexTurnStateSetAt(row *database.AccountRow, update accountSchedulerUpdate) {
-	if row == nil || !update.CodexTurnState.Set || update.CodexTurnState.Value == "" {
-		return
-	}
-	current := strings.TrimSpace(row.GetCredential(auth.CodexTurnStateCredentialKey))
-	currentSetAt := strings.TrimSpace(row.GetCredential(auth.CodexTurnStateSetAtCredentialKey))
-	if current == update.CodexTurnState.Value && currentSetAt != "" {
-		delete(update.CredentialUpdates, auth.CodexTurnStateSetAtCredentialKey)
-	}
+	return errors.New("必须是 off、device、session、single_machine_multi_window 或 full")
 }
 
 func (u accountSchedulerUpdate) hasChanges() bool {
 	return u.ScoreBiasOverride.Set ||
-		u.CodexTurnState.Set ||
-		u.CodexTurnStateModels.Set ||
 		u.BaseConcurrencyOverride.Set ||
 		u.SkipWarmTier.Set ||
 		u.AllowedAPIKeyIDs.Set ||
@@ -2495,7 +2503,8 @@ func (u accountSchedulerUpdate) hasChanges() bool {
 		u.ClaudeClientPlatform.Set ||
 		u.ClaudeVersionPolicy.Set ||
 		u.ClaudeClientVersion.Set ||
-		u.Timezone.Set
+		u.Timezone.Set ||
+		u.ExcelBPSEnabled.Set
 }
 
 func optionalBoolFromPtr(value *bool) database.OptionalBool {
@@ -2578,18 +2587,6 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	if update.CodexTurnState.Set && update.CodexTurnState.Value != "" {
-		row, err := h.db.GetAccountByID(ctx, id)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				writeError(c, http.StatusNotFound, "账号不存在")
-				return
-			}
-			writeError(c, http.StatusInternalServerError, "读取账号失败: "+err.Error())
-			return
-		}
-		refineCodexTurnStateSetAt(row, update)
-	}
 	if update.AllowedAPIKeyIDs.Set {
 		missingAPIKeyIDs, err := h.findMissingAPIKeyIDs(ctx, update.AllowedAPIKeyIDs.Values)
 		if err != nil {
@@ -2782,21 +2779,6 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 	if value, ok := update.CredentialUpdates[auth.UpstreamRequestIDHeaderCredentialKey].(string); ok {
 		h.store.ApplyAccountUpstreamRequestIDHeader(id, value)
 	}
-	if update.CodexTurnState.Set || update.CodexTurnStateModels.Set {
-		if account := h.store.FindByID(id); account != nil {
-			value, models, setAt := account.CodexTurnStateConfig()
-			if update.CodexTurnState.Set {
-				value = update.CodexTurnState.Value
-			}
-			if update.CodexTurnStateModels.Set {
-				models = update.CodexTurnStateModels.Value
-			}
-			if raw, ok := update.CredentialUpdates[auth.CodexTurnStateSetAtCredentialKey].(string); ok {
-				setAt = auth.ParseCodexTurnStateSetAt(raw)
-			}
-			h.store.ApplyAccountCodexTurnState(id, value, models, setAt)
-		}
-	}
 	if update.CustomHeaders.Set {
 		h.store.ApplyAccountCustomHeaders(id, update.CustomHeaders.Values)
 	} else if update.Timezone.Set {
@@ -2843,6 +2825,9 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 	}
 	if update.Timezone.Set {
 		h.store.ApplyAccountTimezone(id, update.Timezone.Value)
+	}
+	if value, ok := update.CredentialUpdates[auth.ExcelBPSCredentialKey].(bool); ok {
+		h.store.ApplyAccountExcelBPSEnabled(id, value)
 	}
 }
 
@@ -4163,16 +4148,17 @@ func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, token
 }
 
 type addOpenAIResponsesAccountReq struct {
-	Name                    string            `json:"name"`
-	BaseURL                 string            `json:"base_url"`
-	APIKey                  string            `json:"api_key"`
-	BalanceQueryURL         string            `json:"balance_query_url"`
-	Models                  []string          `json:"models"`
-	ModelMapping            string            `json:"model_mapping"`
-	CodexClientMetadataMode *string           `json:"codex_client_metadata_mode"`
-	CodexPassthroughMode    *string           `json:"codex_passthrough_mode"`
-	ProxyURL                string            `json:"proxy_url"`
-	CustomHeaders           map[string]string `json:"custom_headers"`
+	Name                       string            `json:"name"`
+	BaseURL                    string            `json:"base_url"`
+	APIKey                     string            `json:"api_key"`
+	BalanceQueryURL            string            `json:"balance_query_url"`
+	Models                     []string          `json:"models"`
+	ModelMapping               string            `json:"model_mapping"`
+	CodexClientMetadataMode    *string           `json:"codex_client_metadata_mode"`
+	CodexPassthroughMode       *string           `json:"codex_passthrough_mode"`
+	ResponsesUpstreamTransport *string           `json:"responses_upstream_transport"`
+	ProxyURL                   string            `json:"proxy_url"`
+	CustomHeaders              map[string]string `json:"custom_headers"`
 }
 
 type fetchOpenAIResponsesModelsReq struct {
@@ -4251,6 +4237,14 @@ func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
 		}
 		codexPassthroughMode = auth.NormalizeCodexPassthroughMode(*req.CodexPassthroughMode)
 	}
+	responsesUpstreamTransport := auth.OpenAIResponsesTransportHTTP
+	if req.ResponsesUpstreamTransport != nil {
+		if !auth.IsValidOpenAIResponsesUpstreamTransport(*req.ResponsesUpstreamTransport) {
+			writeError(c, http.StatusBadRequest, "responses_upstream_transport 必须是 http 或 websocket")
+			return
+		}
+		responsesUpstreamTransport = auth.NormalizeOpenAIResponsesUpstreamTransport(*req.ResponsesUpstreamTransport)
+	}
 	for _, model := range models {
 		if err := security.ValidateModelName(model); err != nil {
 			writeError(c, http.StatusBadRequest, fmt.Sprintf("模型名称无效: %s", model))
@@ -4284,6 +4278,7 @@ func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
 		"model_mapping":                          modelMapping,
 		"codex_client_metadata_mode":             codexClientMetadataMode,
 		"codex_passthrough_mode":                 codexPassthroughMode,
+		"responses_upstream_transport":           responsesUpstreamTransport,
 		"plan_type":                              "api",
 		"email":                                  baseURL,
 	}
@@ -4298,19 +4293,20 @@ func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
 	h.db.InsertAccountEventAsync(id, "added", "manual_openai_responses")
 
 	h.store.AddAccount(&auth.Account{
-		DBID:                    id,
-		ProxyURL:                req.ProxyURL,
-		HealthTier:              auth.HealthTierHealthy,
-		UpstreamType:            auth.UpstreamOpenAIResponses,
-		BaseURL:                 baseURL,
-		APIKey:                  req.APIKey,
-		Models:                  models,
-		ModelMapping:            modelMapping,
-		CodexClientMetadataMode: codexClientMetadataMode,
-		CodexPassthroughMode:    codexPassthroughMode,
-		CustomHeaders:           customHeaders,
-		Email:                   baseURL,
-		PlanType:                "api",
+		DBID:                       id,
+		ProxyURL:                   req.ProxyURL,
+		HealthTier:                 auth.HealthTierHealthy,
+		UpstreamType:               auth.UpstreamOpenAIResponses,
+		BaseURL:                    baseURL,
+		APIKey:                     req.APIKey,
+		Models:                     models,
+		ModelMapping:               modelMapping,
+		CodexClientMetadataMode:    codexClientMetadataMode,
+		CodexPassthroughMode:       codexPassthroughMode,
+		ResponsesUpstreamTransport: responsesUpstreamTransport,
+		CustomHeaders:              customHeaders,
+		Email:                      baseURL,
+		PlanType:                   "api",
 	})
 
 	security.SecurityAuditLog("OPENAI_RESPONSES_ACCOUNT_ADDED", fmt.Sprintf("account_id=%d models=%d ip=%s", id, len(models), c.ClientIP()))
@@ -4471,6 +4467,14 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 		}
 		codexPassthroughMode = auth.NormalizeCodexPassthroughMode(*req.CodexPassthroughMode)
 	}
+	responsesUpstreamTransport := auth.NormalizeOpenAIResponsesUpstreamTransport(row.GetCredential(auth.OpenAIResponsesUpstreamTransportCredentialKey))
+	if req.ResponsesUpstreamTransport != nil {
+		if !auth.IsValidOpenAIResponsesUpstreamTransport(*req.ResponsesUpstreamTransport) {
+			writeError(c, http.StatusBadRequest, "responses_upstream_transport 必须是 http 或 websocket")
+			return
+		}
+		responsesUpstreamTransport = auth.NormalizeOpenAIResponsesUpstreamTransport(*req.ResponsesUpstreamTransport)
+	}
 	for _, model := range models {
 		if err := security.ValidateModelName(model); err != nil {
 			writeError(c, http.StatusBadRequest, fmt.Sprintf("模型名称无效: %s", model))
@@ -4494,6 +4498,7 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 		"model_mapping":                          modelMapping,
 		"codex_client_metadata_mode":             codexClientMetadataMode,
 		"codex_passthrough_mode":                 codexPassthroughMode,
+		"responses_upstream_transport":           responsesUpstreamTransport,
 		"plan_type":                              "api",
 		"email":                                  baseURL,
 		"custom_headers":                         cloneCustomHeaders(customHeaders),
@@ -4717,12 +4722,17 @@ func (h *Handler) SyncAccountUpstreamModels(c *gin.Context) {
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
 	defer cancel()
+	daybreakSnapshot := account.BeginDaybreakObservation()
 	manifest, err := proxy.FetchCodexModelsManifest(ctx, account, h.store.ResolveProxyForAccount(account), "", "")
 	if err != nil {
 		writeError(c, http.StatusBadGateway, fmt.Sprintf("拉取上游模型清单失败: %s", err.Error()))
 		return
 	}
 	proxy.RecordResponsesLiteSupportFromManifest(manifest.Body)
+	if err := (proxy.DaybreakObservation{Account: account, Snapshot: daybreakSnapshot, Body: manifest.Body}).Save(ctx, h.db); err != nil {
+		writeError(c, http.StatusBadGateway, "保存 Daybreak 能力失败: "+err.Error())
+		return
+	}
 	models := auth.NormalizeAccountModels(proxy.ExtractManifestModelSlugs(manifest.Body))
 	if len(models) == 0 {
 		writeError(c, http.StatusBadGateway, "上游模型清单未返回可用模型")
@@ -8320,6 +8330,10 @@ func parseUsageLogsFilter(c *gin.Context, startTime, endTime time.Time) (databas
 	if !ok {
 		return database.UsageLogFilter{}, false
 	}
+	filter.UpstreamModelMismatchOnly, ok = parseUsageLogBoolFilter(c, "upstream_model_mismatch")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
 
 	errorOnly, ok := parseUsageLogBoolFilter(c, "error_only")
 	if !ok {
@@ -9198,6 +9212,7 @@ type settingsResponse struct {
 	AutoCleanError                      bool   `json:"auto_clean_error"`
 	AutoCleanExpired                    bool   `json:"auto_clean_expired"`
 	AutoResetCreditsEnabled             bool   `json:"auto_reset_credits_enabled"`
+	AutoResetCreditsOnExhaustionEnabled bool   `json:"auto_reset_credits_on_exhaustion_enabled"`
 	AutoResetCreditsBeforeExpiryMin     int    `json:"auto_reset_credits_before_expiry_min"`
 	AutoActivate5hWindowEnabled         bool   `json:"auto_activate_5h_window_enabled"`
 	ProxyPoolEnabled                    bool   `json:"proxy_pool_enabled"`
@@ -9232,6 +9247,9 @@ type settingsResponse struct {
 	CodexCLIVersionSyncEnabled          bool   `json:"codex_cli_version_sync_enabled"`
 	CodexCLIVersionSyncIntervalHours    int    `json:"codex_cli_version_sync_interval_hours"`
 	CodexSyncedCLIVersion               string `json:"codex_synced_cli_version"`
+	CodexSyncedDesktopMacBuild          string `json:"codex_synced_desktop_mac_build"`
+	CodexSyncedDesktopWindowsBuild      string `json:"codex_synced_desktop_windows_build"`
+	CodexSyncedVSCodeBuild              string `json:"codex_synced_vscode_build"`
 	// CodexEffectiveCLIVersion 是当前实际用于出站 UA 的版本(内置常量与同步值取大),
 	// 供设置页"设为同步版本"按钮使用——同步值可能过期或为空,内置值才是下限。
 	CodexEffectiveCLIVersion       string `json:"codex_effective_cli_version"`
@@ -9259,29 +9277,29 @@ type settingsResponse struct {
 	GrokOAuthClientIDEffective   string `json:"grok_oauth_client_id_effective"`
 	// Antigravity OAuth client 配置视图（嵌入展平）。
 	antigravityOAuthSettingsView
-	MaxRetries                         int                              `json:"max_retries"`
-	MaxRateLimitRetries                int                              `json:"max_rate_limit_retries"`
-	RetryIntervalMS                    int                              `json:"retry_interval_ms"`
-	TransportRetryPolicy               string                           `json:"transport_retry_policy"`
-	ContinuousRetryEnabled             bool                             `json:"continuous_retry_enabled"`
-	ContinuousRetryCatchAll            bool                             `json:"continuous_retry_catch_all"`
-	ContinuousRetryCategories          []string                         `json:"continuous_retry_categories"`
-	ContinuousRetryStatusCodes         []int                            `json:"continuous_retry_status_codes"`
-	ContinuousRetryErrorCodes          []string                         `json:"continuous_retry_error_codes"`
-	ContinuousRetryMaxDurationSeconds  int                              `json:"continuous_retry_max_duration_seconds"`
-	CodexFingerprintDefaultMode        string                           `json:"codex_fingerprint_default_mode"`
-	AllowRemoteMigration               bool                             `json:"allow_remote_migration"`
-	DatabaseDriver                     string                           `json:"database_driver"`
-	DatabaseLabel                      string                           `json:"database_label"`
-	CacheDriver                        string                           `json:"cache_driver"`
-	CacheLabel                         string                           `json:"cache_label"`
-	ExpiredCleaned                     int                              `json:"expired_cleaned,omitempty"`
-	ModelMapping                       string                           `json:"model_mapping"`
-	CodexModelMapping                  string                           `json:"codex_model_mapping"`
-	PayloadRules                       string                           `json:"payload_rules"`
-	ReasoningEffortModels              string                           `json:"reasoning_effort_models"`
-	ResinURL                           string                           `json:"resin_url"`
-	ResinPlatformName                  string                           `json:"resin_platform_name"`
+	MaxRetries                        int      `json:"max_retries"`
+	MaxRateLimitRetries               int      `json:"max_rate_limit_retries"`
+	RetryIntervalMS                   int      `json:"retry_interval_ms"`
+	TransportRetryPolicy              string   `json:"transport_retry_policy"`
+	ContinuousRetryEnabled            bool     `json:"continuous_retry_enabled"`
+	ContinuousRetryCatchAll           bool     `json:"continuous_retry_catch_all"`
+	ContinuousRetryCategories         []string `json:"continuous_retry_categories"`
+	ContinuousRetryStatusCodes        []int    `json:"continuous_retry_status_codes"`
+	ContinuousRetryErrorCodes         []string `json:"continuous_retry_error_codes"`
+	ContinuousRetryMaxDurationSeconds int      `json:"continuous_retry_max_duration_seconds"`
+	CodexFingerprintDefaultMode       string   `json:"codex_fingerprint_default_mode"`
+	AllowRemoteMigration              bool     `json:"allow_remote_migration"`
+	DatabaseDriver                    string   `json:"database_driver"`
+	DatabaseLabel                     string   `json:"database_label"`
+	CacheDriver                       string   `json:"cache_driver"`
+	CacheLabel                        string   `json:"cache_label"`
+	ExpiredCleaned                    int      `json:"expired_cleaned,omitempty"`
+	ModelMapping                      string   `json:"model_mapping"`
+	CodexModelMapping                 string   `json:"codex_model_mapping"`
+	PayloadRules                      string   `json:"payload_rules"`
+	ReasoningEffortModels             string   `json:"reasoning_effort_models"`
+	ResinURL                          string   `json:"resin_url"`
+	ResinPlatformName                 string   `json:"resin_platform_name"`
 	// CodexEgress 是后端权威的"Codex 渠道当前由谁承担出站"摘要:Resin 启用时代理池与
 	// proxy_url 对 Codex 不生效,界面据此标注,避免三套配置并存看不出谁在生效(issue #679)。
 	CodexEgress                        proxy.CodexEgressSummary         `json:"codex_egress"`
@@ -9384,6 +9402,7 @@ type updateSettingsReq struct {
 	AutoCleanError                      *bool                            `json:"auto_clean_error"`
 	AutoCleanExpired                    *bool                            `json:"auto_clean_expired"`
 	AutoResetCreditsEnabled             *bool                            `json:"auto_reset_credits_enabled"`
+	AutoResetCreditsOnExhaustionEnabled *bool                            `json:"auto_reset_credits_on_exhaustion_enabled"`
 	AutoResetCreditsBeforeExpiryMin     *int                             `json:"auto_reset_credits_before_expiry_min"`
 	AutoActivate5hWindowEnabled         *bool                            `json:"auto_activate_5h_window_enabled"`
 	ProxyPoolEnabled                    *bool                            `json:"proxy_pool_enabled"`
@@ -10151,12 +10170,14 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	}
 	runtimeCfg := proxy.CurrentRuntimeSettings()
 	autoResetCreditsEnabled := runtimeCfg.AutoResetCreditsEnabled
+	autoResetCreditsOnExhaustionEnabled := runtimeCfg.AutoResetCreditsOnExhaustionEnabled
 	autoResetCreditsBeforeExpiryMin := runtimeCfg.AutoResetCreditsBeforeExpiryMin
 	autoActivate5hWindowEnabled := runtimeCfg.AutoActivate5hWindowEnabled
 	// uTLS 优雅关闭等待上限（issue #446）：与自动消费同款，数据库是多实例下的权威来源。
 	utlsShutdownTimeoutMinutes := runtimeCfg.UTLSShutdownTimeoutMin
 	if dbSettings != nil {
 		autoResetCreditsEnabled = dbSettings.AutoResetCreditsEnabled
+		autoResetCreditsOnExhaustionEnabled = dbSettings.AutoResetCreditsOnExhaustionEnabled
 		autoResetCreditsBeforeExpiryMin = dbSettings.AutoResetCreditsBeforeExpiryMin
 		autoActivate5hWindowEnabled = dbSettings.AutoActivate5hWindowEnabled
 		utlsShutdownTimeoutMinutes = database.NormalizeUTLSShutdownTimeoutMinutes(dbSettings.UTLSShutdownTimeoutMinutes)
@@ -10214,6 +10235,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		AutoCleanError:                      h.store.GetAutoCleanError(),
 		AutoCleanExpired:                    h.store.GetAutoCleanExpired(),
 		AutoResetCreditsEnabled:             autoResetCreditsEnabled,
+		AutoResetCreditsOnExhaustionEnabled: autoResetCreditsOnExhaustionEnabled,
 		AutoResetCreditsBeforeExpiryMin:     autoResetCreditsBeforeExpiryMin,
 		AutoActivate5hWindowEnabled:         autoActivate5hWindowEnabled,
 		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
@@ -10248,6 +10270,9 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexCLIVersionSyncEnabled:          h.store.CodexCLIVersionSyncEnabled(),
 		CodexCLIVersionSyncIntervalHours:    h.store.CodexCLIVersionSyncIntervalHours(),
 		CodexSyncedCLIVersion:               proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
+		CodexSyncedDesktopMacBuild:          proxy.CurrentRuntimeSettings().CodexSyncedDesktopMacBuild,
+		CodexSyncedDesktopWindowsBuild:      proxy.CurrentRuntimeSettings().CodexSyncedDesktopWindowsBuild,
+		CodexSyncedVSCodeBuild:              proxy.CurrentRuntimeSettings().CodexSyncedVSCodeBuild,
 		CodexEffectiveCLIVersion:            proxy.LatestCodexCLIVersionForHeaders(),
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
@@ -10625,6 +10650,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	modelPricingOverrides := "{}"
 	modelPricingSyncURL := ""
 	persistedAutoResetCreditsEnabled := false
+	persistedAutoResetCreditsOnExhaustionEnabled := false
 	persistedAutoResetCreditsBeforeExpiryMin := 60
 	persistedAutoActivate5hWindowEnabled := false
 	codexImagesMainModel := ""
@@ -10649,6 +10675,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		modelPricingOverrides = existingSettings.ModelPricingOverrides
 		modelPricingSyncURL = existingSettings.ModelPricingSyncURL
 		persistedAutoResetCreditsEnabled = existingSettings.AutoResetCreditsEnabled
+		persistedAutoResetCreditsOnExhaustionEnabled = existingSettings.AutoResetCreditsOnExhaustionEnabled
 		persistedAutoResetCreditsBeforeExpiryMin = existingSettings.AutoResetCreditsBeforeExpiryMin
 		persistedAutoActivate5hWindowEnabled = existingSettings.AutoActivate5hWindowEnabled
 		codexImagesMainModel = existingSettings.CodexImagesMainModel
@@ -10723,11 +10750,13 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	hasAdminSecret := strings.TrimSpace(currentAdminSecret) != "" || strings.TrimSpace(h.adminSecretEnv) != ""
 	runtimeCfg := proxy.CurrentRuntimeSettings()
 	previousAutoResetCreditsEnabled := runtimeCfg.AutoResetCreditsEnabled
+	previousAutoResetCreditsOnExhaustionEnabled := runtimeCfg.AutoResetCreditsOnExhaustionEnabled
 	previousAutoResetCreditsBeforeExpiryMin := runtimeCfg.AutoResetCreditsBeforeExpiryMin
 	previousAutoActivate5hWindowEnabled := runtimeCfg.AutoActivate5hWindowEnabled
 	// 数据库是多实例下的权威来源；用持久值作为本次 partial update 的基线，
 	// 避免旧实例保存无关字段时把自动消费配置回滚成自己的陈旧快照。
 	runtimeCfg.AutoResetCreditsEnabled = persistedAutoResetCreditsEnabled
+	runtimeCfg.AutoResetCreditsOnExhaustionEnabled = persistedAutoResetCreditsOnExhaustionEnabled
 	runtimeCfg.AutoResetCreditsBeforeExpiryMin = persistedAutoResetCreditsBeforeExpiryMin
 	runtimeCfg.AutoActivate5hWindowEnabled = persistedAutoActivate5hWindowEnabled
 	runtimeCfg.UTLSShutdownTimeoutMin = persistedUTLSShutdownTimeoutMinutes
@@ -10743,7 +10772,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 	continuousRetryChanged := req.ContinuousRetryEnabled != nil || req.ContinuousRetryCatchAll != nil || req.ContinuousRetryCategories != nil || req.ContinuousRetryStatusCodes != nil || req.ContinuousRetryErrorCodes != nil || req.ContinuousRetryMaxDurationSeconds != nil
 	utlsShutdownTimeoutMinutes := persistedUTLSShutdownTimeoutMinutes
-	autoResetCreditsChanged := (req.AutoResetCreditsEnabled != nil && *req.AutoResetCreditsEnabled != persistedAutoResetCreditsEnabled) ||
+	autoResetCreditsChanged := (req.AutoResetCreditsOnExhaustionEnabled != nil && *req.AutoResetCreditsOnExhaustionEnabled != persistedAutoResetCreditsOnExhaustionEnabled) ||
+		(req.AutoResetCreditsEnabled != nil && *req.AutoResetCreditsEnabled != persistedAutoResetCreditsEnabled) ||
 		(req.AutoResetCreditsBeforeExpiryMin != nil && *req.AutoResetCreditsBeforeExpiryMin != persistedAutoResetCreditsBeforeExpiryMin)
 	autoActivate5hChanged := req.AutoActivate5hWindowEnabled != nil && *req.AutoActivate5hWindowEnabled != persistedAutoActivate5hWindowEnabled
 	usageLogMode := h.db.GetUsageLogMode()
@@ -11461,6 +11491,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetIgnoreUsageLimitStatus(*req.IgnoreUsageLimitStatus)
 		log.Printf("设置已更新: ignore_usage_limit_status = %t", *req.IgnoreUsageLimitStatus)
 	}
+	if req.AutoResetCreditsOnExhaustionEnabled != nil {
+		runtimeCfg.AutoResetCreditsOnExhaustionEnabled = *req.AutoResetCreditsOnExhaustionEnabled
+	}
 	if req.AutoResetCreditsEnabled != nil {
 		runtimeCfg.AutoResetCreditsEnabled = *req.AutoResetCreditsEnabled
 		log.Printf("设置已更新: auto_reset_credits_enabled = %t", *req.AutoResetCreditsEnabled)
@@ -11479,6 +11512,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	effectiveRuntimeCfg := runtimeCfg
 	if autoResetCreditsChanged {
 		effectiveRuntimeCfg.AutoResetCreditsEnabled = previousAutoResetCreditsEnabled
+		effectiveRuntimeCfg.AutoResetCreditsOnExhaustionEnabled = previousAutoResetCreditsOnExhaustionEnabled
 		effectiveRuntimeCfg.AutoResetCreditsBeforeExpiryMin = previousAutoResetCreditsBeforeExpiryMin
 	}
 	if autoActivate5hChanged {
@@ -11488,6 +11522,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		// CodexSyncedCLIVersion 由后台同步任务独立维护；管理员保存其他设置时
 		// 必须保留临界区内读到的最新值，避免反向回滚同步结果。
 		effectiveRuntimeCfg.CodexSyncedCLIVersion = current.CodexSyncedCLIVersion
+		effectiveRuntimeCfg.CodexSyncedDesktopMacBuild = current.CodexSyncedDesktopMacBuild
+		effectiveRuntimeCfg.CodexSyncedDesktopWindowsBuild = current.CodexSyncedDesktopWindowsBuild
+		effectiveRuntimeCfg.CodexSyncedVSCodeBuild = current.CodexSyncedVSCodeBuild
 		return effectiveRuntimeCfg
 	})
 
@@ -11731,6 +11768,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoCleanError:                      h.store.GetAutoCleanError(),
 		AutoCleanExpired:                    h.store.GetAutoCleanExpired(),
 		AutoResetCreditsEnabled:             runtimeCfg.AutoResetCreditsEnabled,
+		AutoResetCreditsOnExhaustionEnabled: runtimeCfg.AutoResetCreditsOnExhaustionEnabled,
 		AutoResetCreditsBeforeExpiryMin:     runtimeCfg.AutoResetCreditsBeforeExpiryMin,
 		AutoActivate5hWindowEnabled:         runtimeCfg.AutoActivate5hWindowEnabled,
 		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
@@ -11765,6 +11803,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexCLIVersionSyncEnabled:          h.store.CodexCLIVersionSyncEnabled(),
 		CodexCLIVersionSyncIntervalHours:    h.store.CodexCLIVersionSyncIntervalHours(),
 		CodexSyncedCLIVersion:               proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
+		CodexSyncedDesktopMacBuild:          proxy.CurrentRuntimeSettings().CodexSyncedDesktopMacBuild,
+		CodexSyncedDesktopWindowsBuild:      proxy.CurrentRuntimeSettings().CodexSyncedDesktopWindowsBuild,
+		CodexSyncedVSCodeBuild:              proxy.CurrentRuntimeSettings().CodexSyncedVSCodeBuild,
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
 		SessionAffinitySpread:               h.store.GetSessionAffinitySpread(),
@@ -11932,6 +11973,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		if autoResetCreditsChanged {
 			runtimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
 				runtimeCfg.CodexSyncedCLIVersion = current.CodexSyncedCLIVersion
+				runtimeCfg.CodexSyncedDesktopMacBuild = current.CodexSyncedDesktopMacBuild
+				runtimeCfg.CodexSyncedDesktopWindowsBuild = current.CodexSyncedDesktopWindowsBuild
+				runtimeCfg.CodexSyncedVSCodeBuild = current.CodexSyncedVSCodeBuild
 				return runtimeCfg
 			})
 			h.triggerAutoResetCreditsScan()
@@ -11939,6 +11983,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		if autoActivate5hChanged {
 			runtimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
 				runtimeCfg.CodexSyncedCLIVersion = current.CodexSyncedCLIVersion
+				runtimeCfg.CodexSyncedDesktopMacBuild = current.CodexSyncedDesktopMacBuild
+				runtimeCfg.CodexSyncedDesktopWindowsBuild = current.CodexSyncedDesktopWindowsBuild
+				runtimeCfg.CodexSyncedVSCodeBuild = current.CodexSyncedVSCodeBuild
 				return runtimeCfg
 			})
 			h.triggerAutoActivate5hScan()
@@ -12056,6 +12103,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoCleanError:                      h.store.GetAutoCleanError(),
 		AutoCleanExpired:                    h.store.GetAutoCleanExpired(),
 		AutoResetCreditsEnabled:             runtimeCfg.AutoResetCreditsEnabled,
+		AutoResetCreditsOnExhaustionEnabled: runtimeCfg.AutoResetCreditsOnExhaustionEnabled,
 		AutoResetCreditsBeforeExpiryMin:     runtimeCfg.AutoResetCreditsBeforeExpiryMin,
 		AutoActivate5hWindowEnabled:         runtimeCfg.AutoActivate5hWindowEnabled,
 		ProxyPoolEnabled:                    h.store.GetProxyPoolEnabled(),
@@ -12090,6 +12138,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexCLIVersionSyncEnabled:          h.store.CodexCLIVersionSyncEnabled(),
 		CodexCLIVersionSyncIntervalHours:    h.store.CodexCLIVersionSyncIntervalHours(),
 		CodexSyncedCLIVersion:               proxy.CurrentRuntimeSettings().CodexSyncedCLIVersion,
+		CodexSyncedDesktopMacBuild:          proxy.CurrentRuntimeSettings().CodexSyncedDesktopMacBuild,
+		CodexSyncedDesktopWindowsBuild:      proxy.CurrentRuntimeSettings().CodexSyncedDesktopWindowsBuild,
+		CodexSyncedVSCodeBuild:              proxy.CurrentRuntimeSettings().CodexSyncedVSCodeBuild,
 		CodexEffectiveCLIVersion:            proxy.LatestCodexCLIVersionForHeaders(),
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
@@ -12653,6 +12704,7 @@ func (h *Handler) MigrateAccounts(c *gin.Context) {
 // ListModels 返回支持的模型列表（供前端设置页使用）
 func (h *Handler) ListModels(c *gin.Context) {
 	catalog, _ := proxy.ListModelCatalog(c.Request.Context(), h.db)
+	h.addDaybreakCatalogModels(&catalog)
 	catalog.GrokModels = h.grokChannelModels()
 	catalog.AntigravityModels = h.antigravityChannelModels()
 	// The request-facing catalog must not advertise models contributed only by
@@ -12746,6 +12798,22 @@ func (h *Handler) SyncCodexCLIVersion(c *gin.Context) {
 		proxyURL = h.store.GetProxyURL()
 	}
 	result, err := proxy.SyncCodexCLIVersion(ctx, h.db, proxyURL)
+	if err != nil {
+		writeError(c, http.StatusBadGateway, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// SyncCodexClientVersions 同步 CLI、Desktop 和 VSCode，并返回各来源的独立结果。
+func (h *Handler) SyncCodexClientVersions(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Minute)
+	defer cancel()
+	proxyURL := ""
+	if h.store != nil {
+		proxyURL = h.store.GetProxyURL()
+	}
+	result, err := proxy.SyncCodexClientVersions(ctx, h.db, proxyURL)
 	if err != nil {
 		writeError(c, http.StatusBadGateway, err.Error())
 		return

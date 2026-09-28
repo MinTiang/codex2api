@@ -8,12 +8,13 @@ import (
 func TestNormalizeCodexFingerprintMode(t *testing.T) {
 	// 空值落到部署默认档（内置 session；环境变量与系统设置可覆盖）。
 	cases := map[string]string{
-		"":          DefaultCodexFingerprintMode(),
-		"off":       CodexFingerprintModeOff,
-		"unknown":   CodexFingerprintModeOff,
-		"DEVICE":    CodexFingerprintModeDevice,
-		" session ": CodexFingerprintModeSession,
-		"Full":      CodexFingerprintModeFull,
+		"":                              DefaultCodexFingerprintMode(),
+		"off":                           CodexFingerprintModeOff,
+		"unknown":                       CodexFingerprintModeOff,
+		"DEVICE":                        CodexFingerprintModeDevice,
+		" session ":                     CodexFingerprintModeSession,
+		"Full":                          CodexFingerprintModeFull,
+		" Single_Machine_Multi_Window ": CodexFingerprintModeSingleMachineMultiWindow,
 	}
 	for input, want := range cases {
 		if got := NormalizeCodexFingerprintMode(input); got != want {
@@ -23,7 +24,7 @@ func TestNormalizeCodexFingerprintMode(t *testing.T) {
 }
 
 func TestIsValidCodexFingerprintMode(t *testing.T) {
-	for _, value := range []string{CodexFingerprintModeOff, CodexFingerprintModeDevice, CodexFingerprintModeSession, CodexFingerprintModeFull, " FULL "} {
+	for _, value := range []string{CodexFingerprintModeOff, CodexFingerprintModeDevice, CodexFingerprintModeSession, CodexFingerprintModeFull, CodexFingerprintModeSingleMachineMultiWindow, " FULL "} {
 		if !IsValidCodexFingerprintMode(value) {
 			t.Errorf("IsValidCodexFingerprintMode(%q) = false, want true", value)
 		}

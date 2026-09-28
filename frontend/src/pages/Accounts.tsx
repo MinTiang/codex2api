@@ -42,6 +42,7 @@ import { CompactStat } from "../components/CompactStat";
 import Pagination from "../components/Pagination";
 import StateShell from "../components/StateShell";
 import StatusBadge from "../components/StatusBadge";
+import DaybreakBadge from "../components/DaybreakBadge";
 import { useDataLoader, type LoadOptions } from "../hooks/useDataLoader";
 import {
   useConfirmDialog,
@@ -60,6 +61,7 @@ import type {
   AddOpenAIResponsesAccountRequest,
   CodexClientMetadataMode,
   CodexPassthroughMode,
+  ResponsesUpstreamTransport,
   CodexFingerprintMode,
   UpdateOpenAIResponsesAccountRequest,
   APIKeyRow,
@@ -75,6 +77,7 @@ import type {
   AccountLiveStateResponse,
   UpstreamChannel,
   OpenAIResponsesBalanceResponse,
+  ChannelMonitorBillingSnapshot,
   SubscriptionFilter,
 } from "../types";
 import { SUBSCRIPTION_FILTER_OPTIONS } from "../types";
@@ -88,6 +91,10 @@ import {
   type AccountOperationResultsState,
 } from "../lib/accountOperationResults";
 import { operationProgressMessage } from "../lib/operationProgressMessage";
+import {
+  formatChannelMonitorMultiplier,
+  resolveChannelMonitorRate,
+} from "../lib/channelMonitorBilling";
 import {
   readOperationResultsVisibility,
   writeOperationResultsVisibility,
@@ -111,10 +118,6 @@ import {
   applyOptionalWorkspaceRouteHeader,
   applyWorkspaceRouteHeader,
 } from "../lib/workspaceRoute";
-import {
-  computeCodexTurnStateTtl,
-  formatCodexTurnStateCountdown,
-} from "../lib/codexTurnState";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -202,6 +205,7 @@ import {
   ArrowUpRight,
   Settings2,
   ListChecks,
+  RadioTower,
 } from "lucide-react";
 import {
   CLAUDE_TIMEZONE_CUSTOM,
@@ -229,6 +233,7 @@ import AccountQuotaDistributionChart from "../components/AccountQuotaDistributio
 import AccountRateLimitRecoveryChart from "../components/AccountRateLimitRecoveryChart";
 import AccountGroupMultiSelect from "../components/AccountGroupMultiSelect";
 import AccountQuickConfigSheet from "../components/AccountQuickConfigSheet";
+import ChannelMonitorConfigDialog from "../components/ChannelMonitorConfigDialog";
 import { useImportGroupIds } from "../hooks/useImportGroupIds";
 import AccountGroupFilterSelect, {
   EMPTY_ACCOUNT_GROUP_FILTER,
@@ -681,6 +686,7 @@ function codexFingerprintModeOptions(
     { value: "off", label: t("accounts.codexFingerprintModeOff") },
     { value: "device", label: t("accounts.codexFingerprintModeDevice") },
     { value: "session", label: t("accounts.codexFingerprintModeSession") },
+    { value: "single_machine_multi_window", label: t("accounts.codexFingerprintModeSessionIdentity") },
     { value: "full", label: t("accounts.codexFingerprintModeFull") },
   ];
 }
@@ -692,6 +698,8 @@ function codexFingerprintModeDetail(
   switch (mode) {
     case "device":
       return t("accounts.codexFingerprintModeDeviceDetail");
+    case "single_machine_multi_window":
+      return t("accounts.codexFingerprintModeSessionIdentityDetail");
     case "session":
       return t("accounts.codexFingerprintModeSessionDetail");
     case "full":
@@ -1072,6 +1080,7 @@ interface AccountRowActions {
   openDetail: (account: AccountRow) => void;
   openSchedulerEditor: (account: AccountRow) => void;
   openQuickConfig: (account: AccountRow) => void;
+  openChannelMonitor: (account: AccountRow) => void;
   openQuickGroupEditor: (account: AccountRow) => void;
   openQuickProxyEditor: (account: AccountRow) => void;
   openUsage: (account: AccountRow) => void;
@@ -1128,6 +1137,7 @@ function useCountdownRemaining(until?: string): string {
 // 整树重渲染;行数据没变时这里直接跳过,交互卡顿的大头就在这。
 const AccountTableRow = memo(function AccountTableRow({
   account,
+  channelMonitorBilling,
   sequence,
   selected,
   detailOpen,
@@ -1143,6 +1153,7 @@ const AccountTableRow = memo(function AccountTableRow({
   actions,
 }: {
   account: AccountRow;
+  channelMonitorBilling?: ChannelMonitorBillingSnapshot;
   sequence: number;
   selected: boolean;
   detailOpen: boolean;
@@ -1273,13 +1284,16 @@ const AccountTableRow = memo(function AccountTableRow({
                                       {account.effective_workspace_id}
                                     </span>
                                   )}
-                                  {showEmailDomainTags &&
-                                    getAccountEmailDomain(account) && (
-                                    <EmailDomainBadge
-                                      domain={getAccountEmailDomain(account)}
-                                      t={t}
-                                    />
-                                  )}
+                                  <div className="flex flex-wrap items-center gap-1">
+                                    {showEmailDomainTags &&
+                                      getAccountEmailDomain(account) && (
+                                        <EmailDomainBadge
+                                          domain={getAccountEmailDomain(account)}
+                                          t={t}
+                                        />
+                                      )}
+                                    <DaybreakBadge models={account.daybreak_models} />
+                                  </div>
                                   {(account.at_only ||
                                     account.openai_responses_api ||
                                     account.grok_api ||
@@ -1508,7 +1522,11 @@ const AccountTableRow = memo(function AccountTableRow({
                             )}
                             {visibleColumns.billed && (
                               <TableCell className="text-[13px] text-muted-foreground whitespace-nowrap">
-                                <BilledCell account={account} onOpenOfficial={actions.openOfficialUsage} />
+                                <BilledCell
+                                  account={account}
+                                  channelMonitorBilling={channelMonitorBilling}
+                                  onOpenOfficial={actions.openOfficialUsage}
+                                />
                               </TableCell>
                             )}
                             {visibleColumns.importTime && (
@@ -1598,6 +1616,9 @@ const AccountTableRow = memo(function AccountTableRow({
                                     includeTest={false}
                                     includeDelete={false}
                                     onTest={() => actions.openTesting(account)}
+                                    onChannelMonitor={() =>
+                                      actions.openChannelMonitor(account)
+                                    }
                                     onRefresh={() => actions.refresh(account)}
                                     onGenerateAuthJson={() =>
                                       actions.generateAuthJson(account)
@@ -1628,6 +1649,7 @@ const AccountTableRow = memo(function AccountTableRow({
 // 行数据不变则整卡跳过。
 const AccountCardItem = memo(function AccountCardItem({
   account,
+  channelMonitorBilling,
   sequence,
   selected,
   detailOpen,
@@ -1644,6 +1666,7 @@ const AccountCardItem = memo(function AccountCardItem({
   actions,
 }: {
   account: AccountRow;
+  channelMonitorBilling?: ChannelMonitorBillingSnapshot;
   sequence: number;
   selected: boolean;
   detailOpen: boolean;
@@ -1662,6 +1685,7 @@ const AccountCardItem = memo(function AccountCardItem({
   return (
     <AccountMobileCard
       account={account}
+      channelMonitorBilling={channelMonitorBilling}
       sequence={sequence}
       selected={selected}
       detailOpen={detailOpen}
@@ -1682,6 +1706,7 @@ const AccountCardItem = memo(function AccountCardItem({
       onEditProxy={() => actions.openQuickProxyEditor(account)}
       onUsage={() => actions.openUsage(account)}
       onOpenOfficialUsage={() => actions.openOfficialUsage(account)}
+      onChannelMonitor={() => actions.openChannelMonitor(account)}
       onTest={() => actions.openTesting(account)}
       onRefresh={() => actions.refresh(account)}
       onGenerateAuthJson={() => actions.generateAuthJson(account)}
@@ -1861,6 +1886,7 @@ export default function Accounts() {
   const [cleaningError, setCleaningError] = useState(false);
   const [testingAccount, setTestingAccount] = useState<AccountRow | null>(null);
   const [quickConfigAccount, setQuickConfigAccount] = useState<AccountRow | null>(null);
+  const [channelMonitorAccount, setChannelMonitorAccount] = useState<AccountRow | null>(null);
   const [usageAccount, setUsageAccount] = useState<AccountRow | null>(null);
   // 用量弹窗打开时停在哪个 tab。列表里点「官方结算」成本直接落到官方统计,
   // 其余入口保持默认的概览。
@@ -1903,11 +1929,6 @@ export default function Accounts() {
     useState<CodexFingerprintMode>("off");
   const [editTimezone, setEditTimezone] = useState("");
   const [editTimezoneCustom, setEditTimezoneCustom] = useState(false);
-  // Turn State 强制注入:注入值 + 限定模型(逗号分隔)。仅 Codex 官方账号下发。
-  const [editCodexTurnState, setEditCodexTurnState] = useState("");
-  const [editCodexTurnStateModels, setEditCodexTurnStateModels] = useState("");
-  // 时效倒计时的时钟源:编辑弹窗打开期间每秒推进一次,关闭即停。
-  const [turnStateNow, setTurnStateNow] = useState(() => Date.now());
   // 代理池条目：账号表单里"从代理池选择"下拉的数据源。加载失败静默留空
   // （选择器为空时自动隐藏，不影响手动填代理）。
   const [proxyPool, setProxyPool] = useState<ProxyRow[]>([]);
@@ -1935,6 +1956,7 @@ export default function Accounts() {
       models: [],
       codex_client_metadata_mode: "auto",
       codex_passthrough_mode: "off",
+      responses_upstream_transport: "http",
       proxy_url: "",
     });
   const [openAIModelDraft, setOpenAIModelDraft] = useState("");
@@ -2034,6 +2056,7 @@ export default function Accounts() {
       models: [],
       codex_client_metadata_mode: "auto",
       codex_passthrough_mode: "off",
+      responses_upstream_transport: "http",
       proxy_url: "",
     });
   const [openAIModelMappingText, setOpenAIModelMappingText] = useState("");
@@ -2264,73 +2287,6 @@ export default function Accounts() {
       </p>
     </div>
   );
-
-  // Turn State 时效:只在编辑弹窗打开且该账号已保存注入值时每秒重算;弹窗关闭清掉 interval。
-  const savedCodexTurnState = editingAccount?.codex_turn_state ?? "";
-  const turnStateTtlVisible =
-    editingAccount !== null &&
-    isCodexOfficialAccount(editingAccount) &&
-    savedCodexTurnState !== "" &&
-    editCodexTurnState === savedCodexTurnState;
-  useEffect(() => {
-    if (!turnStateTtlVisible) return;
-    setTurnStateNow(Date.now());
-    const timer = window.setInterval(() => setTurnStateNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [turnStateTtlVisible]);
-
-  const renderCodexTurnStateTtl = () => {
-    if (!turnStateTtlVisible) return null;
-    const ttl = computeCodexTurnStateTtl(
-      editingAccount?.codex_turn_state_set_at,
-      turnStateNow,
-    );
-    if (ttl.kind === "unknown") {
-      return (
-        <p className="mt-1.5 text-xs text-muted-foreground">
-          {t("accounts.codexTurnStateTtlUnknown")}
-        </p>
-      );
-    }
-    if (ttl.kind === "expired") {
-      return (
-        <div className="mt-1.5 space-y-0.5">
-          <p className="flex items-center gap-1.5 text-xs font-medium text-red-600 dark:text-red-400">
-            <Timer className="size-3.5" />
-            {t("accounts.codexTurnStateTtlExpired")}
-          </p>
-          <p className="text-xs text-muted-foreground">
-            {t("accounts.codexTurnStateTtlExpiredHint")}
-          </p>
-        </div>
-      );
-    }
-    const barColor = ttl.warning ? "bg-amber-500" : "bg-emerald-500";
-    const textColor = ttl.warning
-      ? "text-amber-600 dark:text-amber-400"
-      : "text-emerald-600 dark:text-emerald-400";
-    return (
-      <div className="mt-1.5 space-y-1">
-        <p
-          className={cn(
-            "flex items-center gap-1.5 text-xs font-medium tabular-nums",
-            textColor,
-          )}
-        >
-          <Timer className="size-3.5" />
-          {t("accounts.codexTurnStateTtlRemaining", {
-            time: formatCodexTurnStateCountdown(ttl.remainingMs),
-          })}
-        </p>
-        <div className="h-1 w-full overflow-hidden rounded-full bg-muted">
-          <div
-            className={cn("h-full rounded-full transition-[width]", barColor)}
-            style={{ width: `${Math.round(ttl.ratio * 100)}%` }}
-          />
-        </div>
-      </div>
-    );
-  };
 
   const renderWorkspaceRouteInput = ({
     value = workspaceRouteID,
@@ -2897,6 +2853,45 @@ export default function Accounts() {
     () => data.accounts.map((account) => account.id),
     [data.accounts],
   );
+  const responsesAccountIDsKey = useMemo(
+    () => data.accounts
+      .filter((account) => account.openai_responses_api)
+      .map((account) => account.id)
+      .join(","),
+    [data.accounts],
+  );
+  const [channelMonitorBillingByAccount, setChannelMonitorBillingByAccount] = useState<
+    Record<number, ChannelMonitorBillingSnapshot>
+  >({});
+  const refreshChannelMonitorBilling = useCallback(async (signal?: AbortSignal) => {
+    try {
+      const response = await api.getChannelMonitorBillingRates(signal);
+      if (signal?.aborted) return;
+      const next: Record<number, ChannelMonitorBillingSnapshot> = {};
+      for (const item of response.items) {
+        if (item.billing.data) next[item.account_id] = item.billing;
+      }
+      setChannelMonitorBillingByAccount(next);
+    } catch (error) {
+      if (!signal?.aborted) console.warn("channel monitor billing rates load failed:", error);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (providerView !== "codex" || !responsesAccountIDsKey) {
+      setChannelMonitorBillingByAccount({});
+      return undefined;
+    }
+    const controller = new AbortController();
+    void refreshChannelMonitorBilling(controller.signal);
+    const timer = window.setInterval(() => {
+      if (!document.hidden) void refreshChannelMonitorBilling(controller.signal);
+    }, 60_000);
+    return () => {
+      window.clearInterval(timer);
+      controller.abort();
+    };
+  }, [providerView, refreshChannelMonitorBilling, responsesAccountIDsKey]);
   const applyAccountLiveState = useCallback((response: AccountLiveStateResponse) => {
     setData((current) => {
       const accounts = mergeAccountLiveState(current.accounts, response);
@@ -3708,6 +3703,7 @@ export default function Accounts() {
         models: [],
         codex_client_metadata_mode: "auto",
         codex_passthrough_mode: "off",
+        responses_upstream_transport: "http",
         proxy_url: "",
       });
       setOpenAIModelDraft("");
@@ -5197,6 +5193,7 @@ export default function Accounts() {
     try {
       const result = await api.syncAccountModelsUpstream(modelsAccount.id);
       const fetched = result.models ?? [];
+      void reloadSilently();
       setModelsDraft((current) => mergeModelLists(current, fetched));
       showToast(
         t("accounts.supportedModelsSyncDone", { count: fetched.length }),
@@ -5301,6 +5298,7 @@ export default function Accounts() {
       );
     } finally {
       setModelsProbing(false);
+      void reloadSilently();
     }
   };
 
@@ -5638,8 +5636,6 @@ export default function Accounts() {
     setEditTimezoneCustom(
       Boolean(account.timezone && !findClaudeTimezoneOption(account.timezone)),
     );
-    setEditCodexTurnState(account.codex_turn_state ?? "");
-    setEditCodexTurnStateModels(account.codex_turn_state_models ?? "");
     setEditTags(account.tags ?? []);
     setEditGroupIds(account.group_ids ?? []);
     setEditOpenAIForm({
@@ -5652,6 +5648,8 @@ export default function Accounts() {
         account.codex_client_metadata_mode ?? "auto",
       codex_passthrough_mode:
         account.codex_passthrough_mode ?? "off",
+      responses_upstream_transport:
+        account.responses_upstream_transport ?? "http",
       proxy_url: account.proxy_url ?? "",
     });
     setEditOpenAIModelDraft("");
@@ -5699,8 +5697,6 @@ export default function Accounts() {
     setEditCodexFingerprintMode("off");
     setEditTimezone("");
     setEditTimezoneCustom(false);
-    setEditCodexTurnState("");
-    setEditCodexTurnStateModels("");
     setEditTags([]);
     setEditGroupIds([]);
     setEditOpenAIForm({
@@ -5711,6 +5707,7 @@ export default function Accounts() {
       models: [],
       codex_client_metadata_mode: "auto",
       codex_passthrough_mode: "off",
+      responses_upstream_transport: "http",
       proxy_url: "",
     });
     setEditOpenAIModelDraft("");
@@ -5862,8 +5859,6 @@ export default function Accounts() {
           ? {
               codex_fingerprint_mode: editCodexFingerprintMode,
               timezone: editTimezone.trim(),
-              codex_turn_state: editCodexTurnState.trim(),
-              codex_turn_state_models: editCodexTurnStateModels.trim(),
             }
           : {}),
       };
@@ -6045,6 +6040,7 @@ export default function Accounts() {
     openDetail: openAccountDetail,
     openSchedulerEditor,
     openQuickConfig: (account) => setQuickConfigAccount(account),
+    openChannelMonitor: (account) => setChannelMonitorAccount(account),
     openQuickGroupEditor,
     openQuickProxyEditor: (account) => setQuickProxyAccount(account),
     openUsage: (account) => {
@@ -6072,6 +6068,7 @@ export default function Accounts() {
       openDetail: (a) => rowActionsImplRef.current?.openDetail(a),
       openSchedulerEditor: (a) => rowActionsImplRef.current?.openSchedulerEditor(a),
       openQuickConfig: (a) => rowActionsImplRef.current?.openQuickConfig(a),
+      openChannelMonitor: (a) => rowActionsImplRef.current?.openChannelMonitor(a),
       openQuickGroupEditor: (a) => rowActionsImplRef.current?.openQuickGroupEditor(a),
       openQuickProxyEditor: (a) => rowActionsImplRef.current?.openQuickProxyEditor(a),
       openUsage: (a) => rowActionsImplRef.current?.openUsage(a),
@@ -7382,6 +7379,7 @@ export default function Accounts() {
                       <AccountCardItem
                         key={account.id}
                         account={account}
+                        channelMonitorBilling={channelMonitorBillingByAccount[account.id]}
                         sequence={(currentPage - 1) * pageSize + index + 1}
                         selected={selected.has(account.id)}
                         detailOpen={detailAccountId === account.id}
@@ -7640,6 +7638,7 @@ export default function Accounts() {
                         <AccountTableRow
                           key={account.id}
                           account={account}
+                          channelMonitorBilling={channelMonitorBillingByAccount[account.id]}
                           sequence={(currentPage - 1) * pageSize + index + 1}
                           selected={selected.has(account.id)}
                           detailOpen={detailAccountId === account.id}
@@ -8167,6 +8166,34 @@ export default function Accounts() {
                   />
                   <p className="mt-1.5 text-xs text-muted-foreground">
                     {t("accounts.codexPassthroughHint")}
+                  </p>
+                </div>
+                <div>
+                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                    {t("accounts.responsesUpstreamTransport")}
+                  </label>
+                  <Select
+                    value={openAIForm.responses_upstream_transport ?? "http"}
+                    onValueChange={(value) =>
+                      setOpenAIForm((form) => ({
+                        ...form,
+                        responses_upstream_transport:
+                          value as ResponsesUpstreamTransport,
+                      }))
+                    }
+                    options={[
+                      {
+                        value: "http",
+                        label: t("accounts.responsesUpstreamHTTP"),
+                      },
+                      {
+                        value: "websocket",
+                        label: t("accounts.responsesUpstreamWebsocket"),
+                      },
+                    ]}
+                  />
+                  <p className="mt-1.5 text-xs text-muted-foreground">
+                    {t("accounts.responsesUpstreamTransportHint")}
                   </p>
                 </div>
                 <div>
@@ -9018,6 +9045,11 @@ export default function Accounts() {
               if (!detailAccount) return;
               setQuickConfigAccount(detailAccount);
             }}
+            onChannelMonitor={
+              detailAccount?.openai_responses_api && !detailAccount.grok_api
+                ? () => setChannelMonitorAccount(detailAccount)
+                : undefined
+            }
             onEdit={() => {
               if (!detailAccount) return;
               openSchedulerEditor(detailAccount);
@@ -9078,6 +9110,13 @@ export default function Accounts() {
             show={Boolean(quickConfigAccount)}
             onClose={() => setQuickConfigAccount(null)}
             onSaved={() => void reloadSilently()}
+          />
+
+          <ChannelMonitorConfigDialog
+            account={channelMonitorAccount}
+            show={Boolean(channelMonitorAccount)}
+            onClose={() => setChannelMonitorAccount(null)}
+            onSaved={() => void refreshChannelMonitorBilling()}
           />
 
           <Modal
@@ -9330,6 +9369,34 @@ export default function Accounts() {
                       />
                       <p className="mt-1.5 text-xs text-muted-foreground">
                         {t("accounts.codexPassthroughHint")}
+                      </p>
+                    </div>
+                    <div>
+                      <label className="block mb-2 text-xs font-semibold text-muted-foreground">
+                        {t("accounts.responsesUpstreamTransport")}
+                      </label>
+                      <Select
+                        value={editOpenAIForm.responses_upstream_transport ?? "http"}
+                        onValueChange={(value) =>
+                          setEditOpenAIForm((form) => ({
+                            ...form,
+                            responses_upstream_transport:
+                              value as ResponsesUpstreamTransport,
+                          }))
+                        }
+                        options={[
+                          {
+                            value: "http",
+                            label: t("accounts.responsesUpstreamHTTP"),
+                          },
+                          {
+                            value: "websocket",
+                            label: t("accounts.responsesUpstreamWebsocket"),
+                          },
+                        ]}
+                      />
+                      <p className="mt-1.5 text-xs text-muted-foreground">
+                        {t("accounts.responsesUpstreamTransportHint")}
                       </p>
                     </div>
 
@@ -9939,68 +10006,6 @@ export default function Accounts() {
                               onChange: setEditTimezone,
                               onCustomChange: setEditTimezoneCustom,
                             })}
-                          </div>
-                        ) : null}
-
-                        {/* Turn State 强制注入 */}
-                        {isCodexOfficialAccount(editingAccount) ? (
-                          <div className="rounded-xl border border-border/70 bg-card p-4.5 shadow-2xs hover:border-border/90 transition-colors md:col-span-2">
-                            <div className="flex items-center gap-2 font-semibold text-foreground text-sm">
-                              <Hourglass className="size-4 text-amber-500" />
-                              <span>{t("accounts.codexTurnStateTitle")}</span>
-                            </div>
-                            <p className="mt-1 text-xs text-muted-foreground leading-relaxed">
-                              {t("accounts.codexTurnStateHint")}
-                            </p>
-                            <div className="mt-3">
-                              <div className="flex items-center justify-between mb-2">
-                                <label className="block text-sm font-semibold text-muted-foreground">
-                                  {t("accounts.codexTurnStateValueLabel")}
-                                </label>
-                                <Button
-                                  type="button"
-                                  variant="outline"
-                                  size="sm"
-                                  disabled={!editCodexTurnState}
-                                  onClick={() => setEditCodexTurnState("")}
-                                >
-                                  {t("accounts.codexTurnStateClear")}
-                                </Button>
-                              </div>
-                              <textarea
-                                className="w-full min-h-[80px] p-3 border border-input rounded-xl bg-background text-sm resize-y font-mono focus:outline-none focus:ring-2 focus:ring-ring"
-                                placeholder={t(
-                                  "accounts.codexTurnStateValuePlaceholder",
-                                )}
-                                value={editCodexTurnState}
-                                onChange={(
-                                  event: ChangeEvent<HTMLTextAreaElement>,
-                                ) => setEditCodexTurnState(event.target.value)}
-                                rows={3}
-                                spellCheck={false}
-                              />
-                              {renderCodexTurnStateTtl()}
-                            </div>
-                            <div className="mt-3">
-                              <label className="block text-sm font-semibold text-muted-foreground mb-2">
-                                {t("accounts.codexTurnStateModelsLabel")}
-                              </label>
-                              <Input
-                                value={editCodexTurnStateModels}
-                                placeholder={t(
-                                  "accounts.codexTurnStateModelsPlaceholder",
-                                )}
-                                onChange={(
-                                  event: ChangeEvent<HTMLInputElement>,
-                                ) =>
-                                  setEditCodexTurnStateModels(event.target.value)
-                                }
-                                spellCheck={false}
-                              />
-                              <p className="mt-1.5 text-xs text-muted-foreground">
-                                {t("accounts.codexTurnStateModelsHint")}
-                              </p>
-                            </div>
                           </div>
                         ) : null}
 
@@ -13043,6 +13048,7 @@ function formatPlanLabel(planType?: string): string {
   const lower = raw.toLowerCase();
   if (lower === "prolite" || lower === "pro_lite" || lower === "pro-lite")
     return "ProLite";
+  if (lower === "self_serve_business_prolite") return "team5x";
   return raw;
 }
 
@@ -13085,7 +13091,11 @@ function PlanBadge({
 
   const normalized = normalizePlanType(planType);
   const key =
-    normalized === "pro" && label === "ProLite" ? "prolite" : normalized;
+    normalized === "pro" && label === "ProLite"
+      ? "prolite"
+      : label === "team5x"
+        ? "team"
+        : normalized;
   const cls =
     style[key] ||
     "bg-slate-100 text-slate-600 ring-slate-400/20 dark:bg-slate-500/15 dark:text-slate-300 dark:ring-slate-400/20";
@@ -13254,6 +13264,7 @@ function AccountRowActionsMenu({
   includeTest = true,
   includeDelete = true,
   onTest,
+  onChannelMonitor,
   onRefresh,
   onGenerateAuthJson,
   onToggleEnabled,
@@ -13270,6 +13281,7 @@ function AccountRowActionsMenu({
   includeTest?: boolean;
   includeDelete?: boolean;
   onTest: () => void;
+  onChannelMonitor?: () => void;
   onRefresh: () => void;
   onGenerateAuthJson: () => void;
   onToggleEnabled: () => void;
@@ -13297,6 +13309,16 @@ function AccountRowActionsMenu({
             label: t("accounts.testConnection"),
             icon: <Zap className="size-3.5" />,
             onSelect: onTest,
+          },
+        ]
+      : []),
+    ...(account.openai_responses_api && !account.grok_api && onChannelMonitor
+      ? [
+          {
+            key: "channel-monitor",
+            label: "渠道监控",
+            icon: <RadioTower className="size-3.5" />,
+            onSelect: onChannelMonitor,
           },
         ]
       : []),
@@ -13563,6 +13585,7 @@ function GroupChipList({
 
 function AccountMobileCard({
   account,
+  channelMonitorBilling,
   sequence,
   selected,
   detailOpen = false,
@@ -13593,8 +13616,10 @@ function AccountMobileCard({
   onDelete,
   onUsageRefreshed,
   onOpenOfficialUsage,
+  onChannelMonitor,
 }: {
   account: AccountRow;
+  channelMonitorBilling?: ChannelMonitorBillingSnapshot;
   sequence: number;
   selected: boolean;
   detailOpen?: boolean;
@@ -13626,6 +13651,7 @@ function AccountMobileCard({
   onUsageRefreshed?: () => void;
   // 成本列的官方胶囊点击后跳到用量弹窗的官方统计 tab。
   onOpenOfficialUsage?: () => void;
+  onChannelMonitor?: () => void;
 }) {
   const displayName = account.openai_responses_api
     ? formatAccountName(account)
@@ -13774,6 +13800,7 @@ function AccountMobileCard({
                   {resetCredits}
                 </button>
               )}
+              <DaybreakBadge models={account.daybreak_models} />
               {isFullCard && creditBalance !== null && (
                 <button
                   type="button"
@@ -13891,6 +13918,7 @@ function AccountMobileCard({
                   >
                     <BilledCell
                       account={account}
+                      channelMonitorBilling={channelMonitorBilling}
                       onOpenOfficial={onOpenOfficialUsage}
                     />
                   </AccountCardMetric>
@@ -13997,6 +14025,7 @@ function AccountMobileCard({
           refreshing={refreshing}
           authJsonExporting={authJsonExporting}
           onTest={onTest}
+          onChannelMonitor={onChannelMonitor}
           onRefresh={onRefresh}
           onGenerateAuthJson={onGenerateAuthJson}
           onToggleEnabled={onToggleEnabled}
@@ -14658,15 +14687,49 @@ function APIAccountBalanceBadge({ accountId }: { accountId: number }) {
   );
 }
 
+function ChannelMonitorRateBadge({
+  billing,
+}: {
+  billing?: ChannelMonitorBillingSnapshot;
+}) {
+  const rate = resolveChannelMonitorRate(billing?.data, Date.now());
+  if (rate == null) return null;
+
+  const current = billing?.status === "ok";
+  const lastSuccess = billing?.success_at
+    ? formatRelativeTime(billing.success_at)
+    : "未知";
+  const title = current
+    ? `上游当前计费倍率，上次探测 ${lastSuccess}`
+    : `上游最近一次成功计费倍率，成功于 ${lastSuccess}\n当前倍率探测状态：${billing?.status ?? "unknown"}`;
+
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1 whitespace-nowrap rounded-md px-1.5 py-0.5 font-mono text-[11px] tabular-nums ring-1 ring-inset",
+        current
+          ? "bg-sky-500/10 text-sky-700 ring-sky-500/20 dark:text-sky-300"
+          : "bg-amber-500/10 text-amber-700 ring-amber-500/20 dark:text-amber-300",
+      )}
+      title={title}
+    >
+      <Gauge className="size-3 shrink-0" aria-hidden />
+      倍率 ×{formatChannelMonitorMultiplier(rate)}
+    </span>
+  );
+}
+
 // 成本列并排两套账,颜色区分口径:
 // 上行(石板色)是网关自己的日志算出来的,只含经由本网关转发的请求;
 // 下行(琥珀色)是 OpenAI 官方结算数,还包含用户直接用官方客户端的消耗。
 // 两者不该相等,差额就是账号在网关之外的用量。
 function BilledCell({
   account,
+  channelMonitorBilling,
   onOpenOfficial,
 }: {
   account: AccountRow;
+  channelMonitorBilling?: ChannelMonitorBillingSnapshot;
   // 传了才把官方胶囊变成可点按钮（跳到用量弹窗的官方统计 tab）。
   onOpenOfficial?: (account: AccountRow) => void;
 }) {
@@ -14701,7 +14764,7 @@ function BilledCell({
     (account.usage_percent_5h !== null && account.usage_percent_5h !== undefined) ||
     !!account.reset_5h_at;
   const visibleH5 = has5hWindow ? h5 : null;
-  if (visibleH5 === null && d7 === null && !showOfficial && !showAPIBalance) {
+  if (visibleH5 === null && d7 === null && !showOfficial && !showAPIBalance && !channelMonitorBilling?.data) {
     return <span className="text-[12px] text-muted-foreground">-</span>;
   }
   const longLabel = formatLongUsageWindowLabel(account);
@@ -14719,6 +14782,7 @@ function BilledCell({
   return (
     <div className="account-billed-cell flex flex-col items-start gap-1">
       {showAPIBalance && <APIAccountBalanceBadge accountId={account.id} />}
+      {showAPIBalance && <ChannelMonitorRateBadge billing={channelMonitorBilling} />}
       {(visibleH5 !== null || d7 !== null) && (
         <span
           className="account-billed-gateway inline-flex items-center gap-1 whitespace-nowrap rounded-md bg-slate-500/10 px-1.5 py-0.5 font-mono text-[11px] tabular-nums text-slate-700 ring-1 ring-inset ring-slate-500/20 dark:text-slate-300"
