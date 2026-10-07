@@ -490,7 +490,6 @@ func (s *Store) applyPersistentAccountSnapshot(dst, src *Account, enabled bool) 
 	dst.CodexClientMetadataMode = src.CodexClientMetadataMode
 	dst.CodexPassthroughMode = src.CodexPassthroughMode
 	dst.CodexFingerprintMode = src.CodexFingerprintMode
-	dst.ExcelBPSEnabled = src.ExcelBPSEnabled
 	dst.Timezone = src.Timezone
 	dst.ClaudeFingerprintMode = src.ClaudeFingerprintMode
 	dst.claudeSessionWindow = src.claudeSessionWindow
@@ -552,6 +551,7 @@ func (s *Store) applyPersistentAccountSnapshot(dst, src *Account, enabled bool) 
 	dst.CreditSkipUsageWindow = src.CreditSkipUsageWindow
 	dst.IgnoreUsageLimitStatusOverride = cloneBoolPtr(src.IgnoreUsageLimitStatusOverride)
 	dst.SkipWarmTier = src.SkipWarmTier
+	dst.KeepConcurrencyOnDegrade = src.KeepConcurrencyOnDegrade
 	dst.AllowedAPIKeyIDs = cloneInt64Slice(src.AllowedAPIKeyIDs)
 	dst.setAllowedAPIKeyIDsLocked(src.AllowedAPIKeyIDs)
 	dst.Tags = cloneStringSlice(src.Tags)
@@ -571,7 +571,7 @@ func (s *Store) applyPersistentAccountSnapshot(dst, src *Account, enabled bool) 
 	dst.recomputeEffectiveIgnoreUsageLimitStatus(s.IgnoreUsageLimitStatus())
 	dst.recomputeEffectiveGroupBaseConcurrency(s)
 	dst.recomputeEffectiveAutoPause(s)
-	dst.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	dst.recomputeSchedulerLocked(s.maxConcurrency.Load())
 	dst.mu.Unlock()
 
 	if src.Locked != 0 {
@@ -680,7 +680,7 @@ func (s *Store) reloadAccountGroupRoutingByID(ctx context.Context, groupID int64
 			acc.mu.Lock()
 			acc.recomputeEffectiveGroupBaseConcurrency(s)
 			acc.recomputeEffectiveAutoPause(s)
-			acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+			acc.recomputeSchedulerLocked(s.maxConcurrency.Load())
 			acc.mu.Unlock()
 			s.fastSchedulerUpdate(acc)
 		}

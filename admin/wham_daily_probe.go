@@ -11,7 +11,6 @@ import (
 	"math/big"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/codex2api/auth"
@@ -327,7 +326,7 @@ func whamDailyUsageAutoRefreshEligible(account *auth.Account, now time.Time) boo
 	case "unauthorized", "error":
 		return false
 	}
-	addedAt := time.Unix(0, atomic.LoadInt64(&account.AddedAt))
+	addedAt := time.Unix(0, account.AddedAt.Load())
 	if addedAt.Unix() > 0 && now.Sub(addedAt) < whamDailyUsageMinAccountAge {
 		return false
 	}

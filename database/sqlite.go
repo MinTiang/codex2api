@@ -110,6 +110,7 @@ func (db *DB) configureSQLite(ctx context.Context) error {
 
 func (db *DB) migrateSQLite(ctx context.Context) error {
 	statements := []string{
+		codexClientVersionCacheSchema,
 		`CREATE TABLE IF NOT EXISTS accounts (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			name TEXT DEFAULT '',
@@ -326,6 +327,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 				first_token_timeout_seconds INTEGER DEFAULT 0,
 				image_storage_config TEXT DEFAULT '{}',
 				show_full_usage_numbers INTEGER DEFAULT 0,
+				show_upstream_model_mismatch INTEGER DEFAULT 1,
 				public_key_usage_page_enabled INTEGER DEFAULT 1,
 				public_image_studio_page_enabled INTEGER DEFAULT 1,
 				public_account_portal_page_enabled INTEGER DEFAULT 0,
@@ -379,6 +381,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					ignore_usage_limit_status INTEGER DEFAULT 0,
 					auto_reset_credits_enabled INTEGER DEFAULT 0,
 					auto_reset_credits_on_exhaustion_enabled INTEGER DEFAULT 0,
+					codex_unified_client_identity_enabled INTEGER DEFAULT 0,
 					auto_reset_credits_before_expiry_min INTEGER DEFAULT 60,
 					auto_activate_5h_window_enabled INTEGER DEFAULT 0,
 					utls_shutdown_timeout_minutes INTEGER DEFAULT 30,
@@ -599,6 +602,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"usage_logs", "user_billing_mode", "TEXT DEFAULT ''"},
 		{"usage_logs", "image_unit_price", "REAL DEFAULT 0"},
 		{"usage_logs", "billed_image_count", "INTEGER DEFAULT 0"},
+		{"usage_logs", "video_seconds", "INTEGER DEFAULT 0"},
 		{"usage_logs", "image_count", "INTEGER DEFAULT 0"},
 		{"usage_logs", "image_width", "INTEGER DEFAULT 0"},
 		{"usage_logs", "image_height", "INTEGER DEFAULT 0"},
@@ -702,6 +706,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "ignore_usage_limit_status", "INTEGER DEFAULT 0"},
 		{"system_settings", "auto_reset_credits_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "auto_reset_credits_on_exhaustion_enabled", "INTEGER DEFAULT 0"},
+		{"system_settings", "codex_unified_client_identity_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "auto_reset_credits_before_expiry_min", "INTEGER DEFAULT 60"},
 		{"system_settings", "auto_activate_5h_window_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "utls_shutdown_timeout_minutes", "INTEGER DEFAULT 30"},
@@ -776,6 +781,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "billing_tier_policy", "TEXT DEFAULT 'actual'"},
 		{"system_settings", "image_storage_config", "TEXT DEFAULT '{}'"},
 		{"system_settings", "show_full_usage_numbers", "INTEGER DEFAULT 0"},
+		{"system_settings", "show_upstream_model_mismatch", "INTEGER DEFAULT 1"},
 		{"system_settings", "public_key_usage_page_enabled", "INTEGER DEFAULT 1"},
 		{"system_settings", "public_image_studio_page_enabled", "INTEGER DEFAULT 1"},
 		{"system_settings", "public_account_portal_page_enabled", "INTEGER DEFAULT 0"},
@@ -1239,10 +1245,6 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time
 		stats.AvgUserBilled = stats.TotalUserBilled / float64(stats.TotalRequests)
 	}
 	if includeBreakdowns {
-		stats.ModelStats, err = db.getUsageModelStats(ctx, 10, rangeStart, rangeEnd, channel, dim)
-		if err != nil {
-			return nil, err
-		}
 		if err := db.populateUsageBreakdownStats(ctx, stats, rangeStart, rangeEnd, channel, dim); err != nil {
 			return nil, err
 		}

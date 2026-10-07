@@ -1584,10 +1584,16 @@ func dropBareReasoningInputValue(value any) (any, bool, bool) {
 			// Codex reasoning schema 不认 status 字段（400 unknown_parameter），
 			// 自家输出也从不携带；跨渠道会话中客户端可能裸回灌带 status 的
 			// 外渠道 reasoning 输出（issue #565）。
-			if _, has := v["status"]; has {
-				delete(v, "status")
-				return v, true, true
+			changed := false
+			// Responses accepts encrypted reasoning and summary; display-only
+			// content is not accepted when replayed as input.
+			for _, field := range []string{"status", "content"} {
+				if _, has := v[field]; has {
+					delete(v, field)
+					changed = true
+				}
 			}
+			return v, changed, true
 		}
 		return v, false, true
 	default:
@@ -3140,8 +3146,10 @@ func billingServiceTierCostRank(tier string) (int, bool) {
 		return 0, true
 	case "", "default", "standard", "auto", "scale":
 		return 1, true
-	case "priority", "ultrafast":
+	case "priority":
 		return 2, true
+	case "ultrafast":
+		return 3, true
 	default:
 		return 1, false
 	}

@@ -36,6 +36,7 @@ import (
 	"github.com/codex2api/database"
 	"github.com/codex2api/internal/imagestore"
 	"github.com/codex2api/internal/openaiidentity"
+	"github.com/codex2api/internal/version"
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/security"
 	"github.com/codex2api/security/promptfilter"
@@ -1181,6 +1182,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts/:id/grok/state", h.GetGrokAccountState)
 	api.POST("/accounts/:id/grok/sync", h.SyncGrokAccountState)
 	api.POST("/accounts/:id/grok/capabilities/probe", h.ProbeGrokAccountCapabilities)
+	api.GET("/accounts/:id/grok/auth-json", h.GetGrokAccountAuthJSON)
 	api.POST("/accounts/:id/oauth/exchange-code", h.UpdateOAuthAccountCode)
 	api.POST("/accounts/import", h.ImportAccounts)
 	api.POST("/accounts/sub2api/preview", h.PreviewSub2APIAccounts)
@@ -1219,6 +1221,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/invite/plan/probe", h.ProbeInviteGuidePlan)
 	api.GET("/accounts/:id/test", h.TestConnection)
 	api.GET("/accounts/:id/model-detector", h.DetectCodexModel)
+	api.GET("/modeltrace/bank", h.GetModelTraceBank)
+	api.POST("/modeltrace/bank/update", h.UpdateModelTraceBank)
+	api.DELETE("/modeltrace/bank", h.ResetModelTraceBank)
 	api.GET("/accounts/:id/quality-test/options", h.QualityTestOptions)
 	api.POST("/accounts/:id/quality-test", h.CreateQualityTestJob)
 	api.GET("/quality-tests", h.ListQualityTests)
@@ -1260,6 +1265,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.DELETE("/usage/logs", h.ClearUsageLogs)
 	api.GET("/setup-hints", h.GetSetupHints)
 	api.GET("/keys", h.ListAPIKeys)
+	api.GET("/keys-concurrency", h.GetAPIKeyConcurrency)
 	api.POST("/keys", h.CreateAPIKey)
 	api.POST("/keys/reset-all-quotas", h.ResetAllAPIKeyQuotas)
 	api.PATCH("/keys/:id", h.UpdateAPIKey)
@@ -1683,7 +1689,6 @@ type accountResponse struct {
 	GrokAPI                       bool                        `json:"grok_api,omitempty"`
 	AntigravityAPI                bool                        `json:"antigravity_api,omitempty"`
 	ClaudeAPI                     bool                        `json:"claude_api,omitempty"`
-	ExcelBPSEnabled               bool                        `json:"openai_excel_bps,omitempty"`
 	ClaudeAuthKind                string                      `json:"claude_auth_kind,omitempty"`
 	ClaudeBaseURL                 string                      `json:"claude_base_url,omitempty"`
 	AntigravityAuthKind           string                      `json:"antigravity_auth_kind,omitempty"`
@@ -1718,6 +1723,7 @@ type accountResponse struct {
 	ClaudeVersionPolicyOverride   string                      `json:"claude_version_policy_override,omitempty"`
 	ClaudeClientVersionOverride   string                      `json:"claude_client_version_override,omitempty"`
 	Timezone                      string                      `json:"timezone,omitempty"`
+	AccountHref                   string                      `json:"account_href,omitempty"`
 	CustomHeaders                 map[string]string           `json:"custom_headers,omitempty"`
 	HealthTier                    string                      `json:"health_tier"`
 	SchedulerScore                float64                     `json:"scheduler_score"`
@@ -1766,6 +1772,7 @@ type accountResponse struct {
 	AutoPause7dThreshold          *float64                    `json:"auto_pause_7d_threshold"`
 	AutoPause5hDisabled           bool                        `json:"auto_pause_5h_disabled"`
 	AutoPause7dDisabled           bool                        `json:"auto_pause_7d_disabled"`
+	KeepConcurrencyOnDegrade      bool                        `json:"keep_concurrency_on_degrade"`
 	UsageLimitOverride            *bool                       `json:"ignore_usage_limit_status_override"`
 	UsageLimitEffective           bool                        `json:"ignore_usage_limit_status_effective"`
 	DispatchCountLimit            *int64                      `json:"dispatch_count_limit"`
@@ -2102,7 +2109,6 @@ type accountLiteResponse struct {
 	OpenAIResponsesAPI bool   `json:"openai_responses_api"`
 	GrokAPI            bool   `json:"grok_api"`
 	ClaudeAPI          bool   `json:"claude_api"`
-	ExcelBPSEnabled    bool   `json:"openai_excel_bps"`
 	AgentIdentity      bool   `json:"agent_identity"`
 	GrokAuthKind       string `json:"grok_auth_kind,omitempty"`
 }
@@ -2159,7 +2165,6 @@ func (h *Handler) listAccountsLite(c *gin.Context, ctx context.Context) {
 			OpenAIResponsesAPI: isOpenAIResponsesAccount,
 			GrokAPI:            isGrokAccount,
 			ClaudeAPI:          isClaudeAccount,
-			ExcelBPSEnabled:    row.GetCredentialBool(auth.ExcelBPSCredentialKey),
 			AgentIdentity:      isAgentIdentityCredentialRow(row),
 			GrokAuthKind:       grokAuthKind,
 		})
@@ -2172,6 +2177,7 @@ type updateAccountSchedulerReq struct {
 	ScoreBiasOverride       json.RawMessage `json:"score_bias_override"`
 	BaseConcurrencyOverride json.RawMessage `json:"base_concurrency_override"`
 	SkipWarmTier            json.RawMessage `json:"skip_warm_tier"`
+	KeepConcurrency         json.RawMessage `json:"keep_concurrency_on_degrade"`
 	AllowedAPIKeyIDs        json.RawMessage `json:"allowed_api_key_ids"`
 	Tags                    json.RawMessage `json:"tags"`
 	GroupIDs                json.RawMessage `json:"group_ids"`
@@ -2190,13 +2196,14 @@ type updateAccountSchedulerReq struct {
 	ClaudeVersionPolicy     json.RawMessage `json:"claude_version_policy"`
 	ClaudeClientVersion     json.RawMessage `json:"claude_client_version"`
 	Timezone                json.RawMessage `json:"timezone"`
-	ExcelBPSEnabled         json.RawMessage `json:"openai_excel_bps"`
+	AccountHref             json.RawMessage `json:"account_href"`
 }
 
 type accountSchedulerUpdate struct {
 	ScoreBiasOverride       database.OptionalNullInt64
 	BaseConcurrencyOverride database.OptionalNullInt64
 	SkipWarmTier            database.OptionalBool
+	KeepConcurrency         database.OptionalBool
 	AllowedAPIKeyIDs        database.OptionalInt64Slice
 	Tags                    optionalStringSlice
 	GroupIDs                database.OptionalInt64Slice
@@ -2215,7 +2222,7 @@ type accountSchedulerUpdate struct {
 	ClaudeVersionPolicy     database.OptionalString
 	ClaudeClientVersion     database.OptionalString
 	Timezone                database.OptionalString
-	ExcelBPSEnabled         database.OptionalBool
+	AccountHref             database.OptionalString
 	CredentialUpdates       map[string]interface{}
 }
 
@@ -2230,6 +2237,10 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		return accountSchedulerUpdate{}, err
 	}
 	skipWarmTier, err := parseOptionalBoolField(req.SkipWarmTier, "skip_warm_tier")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	keepConcurrency, err := parseOptionalBoolField(req.KeepConcurrency, auth.KeepConcurrencyOnDegradeCredentialKey)
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
@@ -2322,7 +2333,7 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
-	excelBPSEnabled, err := parseOptionalBoolField(req.ExcelBPSEnabled, "openai_excel_bps")
+	accountHref, err := parseOptionalStringField(req.AccountHref, "account_href", validateAccountHref)
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
@@ -2360,8 +2371,12 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	if timezoneField.Set {
 		credentialUpdates[auth.AccountTimezoneCredentialKey] = strings.TrimSpace(timezoneField.Value)
 	}
-	if excelBPSEnabled.Set {
-		credentialUpdates[auth.ExcelBPSCredentialKey] = excelBPSEnabled.Value
+	if accountHref.Set {
+		normalized, err := auth.NormalizeAccountHref(accountHref.Value)
+		if err != nil {
+			return accountSchedulerUpdate{}, err
+		}
+		credentialUpdates[auth.AccountHrefCredentialKey] = normalized
 	}
 	if autoPause5hThreshold.Set {
 		credentialUpdates["auto_pause_5h_threshold"] = autoPause5hThreshold.Value
@@ -2374,6 +2389,9 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	}
 	if autoPause7dDisabled.Set {
 		credentialUpdates["auto_pause_7d_disabled"] = autoPause7dDisabled.Value
+	}
+	if keepConcurrency.Set {
+		credentialUpdates[auth.KeepConcurrencyOnDegradeCredentialKey] = keepConcurrency.Value
 	}
 	if ignoreUsageLimitStatusOverride.Set {
 		if ignoreUsageLimitStatusOverride.Value == nil {
@@ -2404,6 +2422,7 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		ScoreBiasOverride:       scoreBiasOverride,
 		BaseConcurrencyOverride: baseConcurrencyOverride,
 		SkipWarmTier:            skipWarmTier,
+		KeepConcurrency:         keepConcurrency,
 		AllowedAPIKeyIDs:        allowedAPIKeyIDs,
 		Tags:                    tags,
 		GroupIDs:                groupIDs,
@@ -2422,7 +2441,7 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		ClaudeVersionPolicy:     claudeVersionPolicy,
 		ClaudeClientVersion:     claudeClientVersion,
 		Timezone:                timezoneField,
-		ExcelBPSEnabled:         excelBPSEnabled,
+		AccountHref:             accountHref,
 		CredentialUpdates:       credentialUpdates,
 	}, nil
 }
@@ -2474,6 +2493,13 @@ func validateAccountTimezone(value string) error {
 	return nil
 }
 
+// validateAccountHref 允许空串(=清除跳转地址,回退 api-base),其余必须是
+// http/https 绝对地址;归一化在写库前由 auth.NormalizeAccountHref 完成。
+func validateAccountHref(value string) error {
+	_, err := auth.NormalizeAccountHref(value)
+	return err
+}
+
 // validateCodexFingerprintMode 允许空串（等价于默认档 off），其余必须是已知档位。
 func validateCodexFingerprintMode(value string) error {
 	if value == "" || auth.IsValidCodexFingerprintMode(value) {
@@ -2486,6 +2512,7 @@ func (u accountSchedulerUpdate) hasChanges() bool {
 	return u.ScoreBiasOverride.Set ||
 		u.BaseConcurrencyOverride.Set ||
 		u.SkipWarmTier.Set ||
+		u.KeepConcurrency.Set ||
 		u.AllowedAPIKeyIDs.Set ||
 		u.Tags.Set ||
 		u.GroupIDs.Set ||
@@ -2504,7 +2531,7 @@ func (u accountSchedulerUpdate) hasChanges() bool {
 		u.ClaudeVersionPolicy.Set ||
 		u.ClaudeClientVersion.Set ||
 		u.Timezone.Set ||
-		u.ExcelBPSEnabled.Set
+		u.AccountHref.Set
 }
 
 func optionalBoolFromPtr(value *bool) database.OptionalBool {
@@ -2746,6 +2773,9 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 			optionalBoolPtr(update.SkipWarmTier),
 		)
 	}
+	if update.KeepConcurrency.Set {
+		h.store.ApplyAccountKeepConcurrencyOnDegrade(id, update.KeepConcurrency.Value)
+	}
 	if update.AllowedAPIKeyIDs.Set {
 		h.store.ApplyAccountAllowedAPIKeys(id, update.AllowedAPIKeyIDs.Values)
 	}
@@ -2825,9 +2855,6 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 	}
 	if update.Timezone.Set {
 		h.store.ApplyAccountTimezone(id, update.Timezone.Value)
-	}
-	if value, ok := update.CredentialUpdates[auth.ExcelBPSCredentialKey].(bool); ok {
-		h.store.ApplyAccountExcelBPSEnabled(id, value)
 	}
 }
 
@@ -4371,7 +4398,13 @@ func (h *Handler) FetchOpenAIResponsesModels(c *gin.Context) {
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
 	defer cancel()
-	models, err := fetchOpenAIResponsesModelIDs(ctx, baseURL, req.APIKey, req.ProxyURL, customHeaders)
+	// 编辑已有账号时带上账号本身：号池画像按账号抽取，统一身份开关下与该账号的
+	// 对话请求取同一份身份（issue #774）；新建账号尚未落库，为空。
+	var account *auth.Account
+	if req.AccountID > 0 && h.store != nil {
+		account = h.store.FindByID(req.AccountID)
+	}
+	models, err := fetchOpenAIResponsesModelIDs(ctx, account, baseURL, req.APIKey, req.ProxyURL, customHeaders)
 	if err != nil {
 		writeError(c, http.StatusBadGateway, err.Error())
 		return
@@ -4528,7 +4561,7 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 	writeMessage(c, http.StatusOK, "OpenAI Responses API 账号设置已更新")
 }
 
-func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL string, customHeaders map[string]string) ([]string, error) {
+func fetchOpenAIResponsesModelIDs(ctx context.Context, account *auth.Account, baseURL, apiKey, proxyURL string, customHeaders map[string]string) ([]string, error) {
 	endpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/models")
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	baseDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
@@ -4546,7 +4579,7 @@ func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Accept", "application/json")
-	proxy.ApplyCodexModelDiscoveryHeaders(req.Header, baseURL+"|"+apiKey)
+	proxy.ApplyCodexModelDiscoveryHeaders(req.Header, account, baseURL, apiKey)
 	for name, value := range customHeaders {
 		name = strings.TrimSpace(name)
 		if name == "" {
@@ -4723,7 +4756,7 @@ func (h *Handler) SyncAccountUpstreamModels(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
 	defer cancel()
 	daybreakSnapshot := account.BeginDaybreakObservation()
-	manifest, err := proxy.FetchCodexModelsManifest(ctx, account, h.store.ResolveProxyForAccount(account), "", "")
+	manifest, err := proxy.FetchCodexModelsManifest(ctx, account, h.store.ResolveProxyForAccount(account), "", "", nil)
 	if err != nil {
 		writeError(c, http.StatusBadGateway, fmt.Sprintf("拉取上游模型清单失败: %s", err.Error()))
 		return
@@ -6328,9 +6361,9 @@ func (h *Handler) RefreshAccountUsage(c *gin.Context) {
 			}
 			if value := row.GetCredential(auth.ClaudeUsageWindowsCredentialKey); value != "" {
 				resp["claude_usage_windows_probed"] = true
-				if windows := parseClaudeUsageWindows(value); len(windows) > 0 {
-					resp["claude_usage_windows"] = windows
-				}
+			}
+			if windows := claudeAccountUsageWindows(row); len(windows) > 0 {
+				resp["claude_usage_windows"] = windows
 			}
 		}
 	}
@@ -7497,10 +7530,12 @@ func (h *Handler) refreshSingleAccount(ctx context.Context, id int64) error {
 
 // GetHealth 系统健康检查（扩展版）
 func (h *Handler) GetHealth(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, healthResponse{
-		Status:    "ok",
-		Available: h.store.AvailableCount(),
-		Total:     h.store.AccountCount(),
+		Status:       "ok",
+		Available:    h.store.AvailableCount(),
+		Total:        h.store.AccountCount(),
+		BuildVersion: version.Current(),
 	})
 }
 
@@ -8487,7 +8522,9 @@ func (h *Handler) ClearUsageLogs(c *gin.Context) {
 
 // ==================== API Keys ====================
 
-// ListAPIKeys 获取所有 API 密钥（脱敏版本）
+// ListAPIKeys 获取所有 API 密钥（脱敏版本）。
+// view=lite 只返回密钥行本身,跳过窗口费用与最近使用时间:这两项要聚合 usage_logs,
+// 而筛选下拉、横幅等场景用不到,慢盘 SQLite 上每次打开页面都白扫一遍。
 func (h *Handler) ListAPIKeys(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
@@ -8495,6 +8532,14 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 	keys, err := h.db.ListAPIKeys(ctx)
 	if err != nil {
 		writeInternalError(c, err)
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(c.Query("view")), "lite") {
+		maskedKeys := make([]*MaskedAPIKeyRow, 0, len(keys))
+		for _, k := range keys {
+			maskedKeys = append(maskedKeys, NewMaskedAPIKeyRow(k))
+		}
+		c.JSON(http.StatusOK, apiKeysResponse{Keys: maskedKeys})
 		return
 	}
 
@@ -9008,11 +9053,11 @@ func sanitizeImageGenerationPolicy(in database.APIKeyLimits) string {
 }
 
 // knownAPIKeyPlanFilters 是账号套餐白名单允许的取值集合。与前端 PlanMultiSelect 的
-// 选项、以及 Accounts 页的套餐筛选保持一致(按原始 plan_type 精确匹配,pro 与 prolite
+// 选项、以及 Accounts 页的套餐筛选保持一致(按原始 plan_type 精确匹配,pro 与 prolite/promax
 // 相互独立)。未知值在 cleanPlanAllow 中被丢弃,避免把打字错误写进过滤条件后导致该
 // Key 永远选不到账号。
 var knownAPIKeyPlanFilters = map[string]struct{}{
-	"free": {}, "plus": {}, "pro": {}, "prolite": {}, "team": {}, "k12": {}, "go": {},
+	"free": {}, "plus": {}, "pro": {}, "prolite": {}, "promax": {}, "team": {}, "k12": {}, "go": {},
 	// Grok live /user.subscriptionTier values. These labels are authorization
 	// inputs only when auth.Store has a fresh live fact; JWT/archive labels never
 	// satisfy plan_allow. "api" is the explicit xAI API-key channel plan.
@@ -9250,6 +9295,9 @@ type settingsResponse struct {
 	CodexSyncedDesktopMacBuild          string `json:"codex_synced_desktop_mac_build"`
 	CodexSyncedDesktopWindowsBuild      string `json:"codex_synced_desktop_windows_build"`
 	CodexSyncedVSCodeBuild              string `json:"codex_synced_vscode_build"`
+
+	CodexClientVersions []proxy.CodexClientVersionTarget `json:"codex_client_versions"`
+
 	// CodexEffectiveCLIVersion 是当前实际用于出站 UA 的版本(内置常量与同步值取大),
 	// 供设置页"设为同步版本"按钮使用——同步值可能过期或为空,内置值才是下限。
 	CodexEffectiveCLIVersion       string `json:"codex_effective_cli_version"`
@@ -9327,6 +9375,7 @@ type settingsResponse struct {
 	CodexUserAgentConfig               string                           `json:"codex_user_agent_config"`
 	CodexTelemetryEnabled              bool                             `json:"codex_telemetry_enabled"`
 	CodexTelemetryTimingDebug          bool                             `json:"codex_telemetry_timing_debug"`
+	CodexUnifiedClientIdentityEnabled  bool                             `json:"codex_unified_client_identity_enabled"`
 	UsageLogMode                       string                           `json:"usage_log_mode"`
 	UsageLogBatchSize                  int                              `json:"usage_log_batch_size"`
 	UsageLogFlushIntervalSeconds       int                              `json:"usage_log_flush_interval_seconds"`
@@ -9337,6 +9386,7 @@ type settingsResponse struct {
 	BillingTierPolicy                  string                           `json:"billing_tier_policy"`
 	ModelsListReadMaxBytes             int64                            `json:"models_list_read_max_bytes"`
 	ShowFullUsageNumbers               bool                             `json:"show_full_usage_numbers"`
+	ShowUpstreamModelMismatch          bool                             `json:"show_upstream_model_mismatch"`
 	PublicKeyUsagePageEnabled          bool                             `json:"public_key_usage_page_enabled"`
 	PublicImageStudioPageEnabled       bool                             `json:"public_image_studio_page_enabled"`
 	PublicAccountPortalPageEnabled     bool                             `json:"public_account_portal_page_enabled"`
@@ -9497,6 +9547,7 @@ type updateSettingsReq struct {
 	CodexUserAgentConfig                *string                          `json:"codex_user_agent_config"`
 	CodexTelemetryEnabled               *bool                            `json:"codex_telemetry_enabled"`
 	CodexTelemetryTimingDebug           *bool                            `json:"codex_telemetry_timing_debug"`
+	CodexUnifiedClientIdentityEnabled   *bool                            `json:"codex_unified_client_identity_enabled"`
 	UsageLogMode                        *string                          `json:"usage_log_mode"`
 	UsageLogBatchSize                   *int                             `json:"usage_log_batch_size"`
 	UsageLogFlushIntervalSeconds        *int                             `json:"usage_log_flush_interval_seconds"`
@@ -9507,6 +9558,7 @@ type updateSettingsReq struct {
 	BillingTierPolicy                   *string                          `json:"billing_tier_policy"`
 	ModelsListReadMaxBytes              *int64                           `json:"models_list_read_max_bytes"`
 	ShowFullUsageNumbers                *bool                            `json:"show_full_usage_numbers"`
+	ShowUpstreamModelMismatch           *bool                            `json:"show_upstream_model_mismatch"`
 	PublicKeyUsagePageEnabled           *bool                            `json:"public_key_usage_page_enabled"`
 	PublicImageStudioPageEnabled        *bool                            `json:"public_image_studio_page_enabled"`
 	PublicAccountPortalPageEnabled      *bool                            `json:"public_account_portal_page_enabled"`
@@ -10147,6 +10199,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	var resinURL, resinPlatformName string
 	branding := brandingFromSettings(dbSettings)
 	showFullUsageNumbers := false
+	showUpstreamModelMismatch := true
 	publicKeyUsagePageEnabled := true
 	publicImageStudioPageEnabled := true
 	publicAccountPortalPageEnabled := false
@@ -10157,6 +10210,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		resinURL = dbSettings.ResinURL
 		resinPlatformName = dbSettings.ResinPlatformName
 		showFullUsageNumbers = dbSettings.ShowFullUsageNumbers
+		showUpstreamModelMismatch = dbSettings.ShowUpstreamModelMismatch
 		publicKeyUsagePageEnabled = dbSettings.PublicKeyUsagePageEnabled
 		publicImageStudioPageEnabled = dbSettings.PublicImageStudioPageEnabled
 		publicAccountPortalPageEnabled = dbSettings.PublicAccountPortalPageEnabled
@@ -10273,6 +10327,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexSyncedDesktopMacBuild:          proxy.CurrentRuntimeSettings().CodexSyncedDesktopMacBuild,
 		CodexSyncedDesktopWindowsBuild:      proxy.CurrentRuntimeSettings().CodexSyncedDesktopWindowsBuild,
 		CodexSyncedVSCodeBuild:              proxy.CurrentRuntimeSettings().CodexSyncedVSCodeBuild,
+		CodexClientVersions:                 proxy.CodexClientVersionCacheView(),
 		CodexEffectiveCLIVersion:            proxy.LatestCodexCLIVersionForHeaders(),
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
@@ -10340,6 +10395,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexUserAgentConfig:                runtimeCfg.CodexUserAgentConfig,
 		CodexTelemetryEnabled:               runtimeCfg.CodexTelemetryEnabled,
 		CodexTelemetryTimingDebug:           runtimeCfg.CodexTelemetryTimingDebug,
+		CodexUnifiedClientIdentityEnabled:   runtimeCfg.CodexUnifiedClientIdentityEnabled,
 		UsageLogMode:                        h.db.GetUsageLogMode(),
 		UsageLogBatchSize:                   h.db.GetUsageLogBatchSize(),
 		UsageLogFlushIntervalSeconds:        h.db.GetUsageLogFlushIntervalSeconds(),
@@ -10350,6 +10406,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		BillingTierPolicy:                   runtimeCfg.BillingTierPolicy,
 		ModelsListReadMaxBytes:              runtimeCfg.ModelsListReadMaxBytes,
 		ShowFullUsageNumbers:                showFullUsageNumbers,
+		ShowUpstreamModelMismatch:           showUpstreamModelMismatch,
 		PublicKeyUsagePageEnabled:           publicKeyUsagePageEnabled,
 		PublicImageStudioPageEnabled:        publicImageStudioPageEnabled,
 		PublicAccountPortalPageEnabled:      publicAccountPortalPageEnabled,
@@ -10644,6 +10701,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	siteLogo := ""
 	bgCfg := defaultBackgroundConfig()
 	showFullUsageNumbers := false
+	showUpstreamModelMismatch := true
 	publicKeyUsagePageEnabled := true
 	publicImageStudioPageEnabled := true
 	publicAccountPortalPageEnabled := false
@@ -10669,6 +10727,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		siteLogo = strings.TrimSpace(existingSettings.SiteLogo)
 		bgCfg = decodeBackgroundConfig(existingSettings.BackgroundConfig)
 		showFullUsageNumbers = existingSettings.ShowFullUsageNumbers
+		showUpstreamModelMismatch = existingSettings.ShowUpstreamModelMismatch
 		publicKeyUsagePageEnabled = existingSettings.PublicKeyUsagePageEnabled
 		publicImageStudioPageEnabled = existingSettings.PublicImageStudioPageEnabled
 		publicAccountPortalPageEnabled = existingSettings.PublicAccountPortalPageEnabled
@@ -11419,6 +11478,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		runtimeCfg.CodexTelemetryTimingDebug = *req.CodexTelemetryTimingDebug
 		log.Printf("设置已更新: codex_telemetry_timing_debug = %t", runtimeCfg.CodexTelemetryTimingDebug)
 	}
+	if req.CodexUnifiedClientIdentityEnabled != nil {
+		runtimeCfg.CodexUnifiedClientIdentityEnabled = *req.CodexUnifiedClientIdentityEnabled
+		log.Printf("设置已更新: codex_unified_client_identity_enabled = %t", runtimeCfg.CodexUnifiedClientIdentityEnabled)
+	}
 	if req.StreamFlushPolicy != nil {
 		runtimeCfg.StreamFlushPolicy = proxy.NormalizeStreamFlushPolicy(*req.StreamFlushPolicy)
 		log.Printf("设置已更新: stream_flush_policy = %s", runtimeCfg.StreamFlushPolicy)
@@ -11442,6 +11505,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	if req.ShowFullUsageNumbers != nil {
 		showFullUsageNumbers = *req.ShowFullUsageNumbers
 		log.Printf("设置已更新: show_full_usage_numbers = %t", showFullUsageNumbers)
+	}
+	if req.ShowUpstreamModelMismatch != nil {
+		showUpstreamModelMismatch = *req.ShowUpstreamModelMismatch
+		log.Printf("设置已更新: show_upstream_model_mismatch = %t", showUpstreamModelMismatch)
 	}
 	if req.PublicKeyUsagePageEnabled != nil {
 		publicKeyUsagePageEnabled = *req.PublicKeyUsagePageEnabled
@@ -11848,6 +11915,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexUserAgentConfig:                runtimeCfg.CodexUserAgentConfig,
 		CodexTelemetryEnabled:               runtimeCfg.CodexTelemetryEnabled,
 		CodexTelemetryTimingDebug:           runtimeCfg.CodexTelemetryTimingDebug,
+		CodexUnifiedClientIdentityEnabled:   runtimeCfg.CodexUnifiedClientIdentityEnabled,
 		UsageLogMode:                        usageLogMode,
 		UsageLogBatchSize:                   usageLogBatchSize,
 		UsageLogFlushIntervalSeconds:        usageLogFlushIntervalSeconds,
@@ -11857,6 +11925,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		FirstTokenTimeoutSeconds:            runtimeCfg.FirstTokenTimeoutSec,
 		BillingTierPolicy:                   runtimeCfg.BillingTierPolicy,
 		ShowFullUsageNumbers:                showFullUsageNumbers,
+		ShowUpstreamModelMismatch:           showUpstreamModelMismatch,
 		PublicKeyUsagePageEnabled:           publicKeyUsagePageEnabled,
 		PublicImageStudioPageEnabled:        publicImageStudioPageEnabled,
 		PublicAccountPortalPageEnabled:      publicAccountPortalPageEnabled,
@@ -12141,6 +12210,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexSyncedDesktopMacBuild:          proxy.CurrentRuntimeSettings().CodexSyncedDesktopMacBuild,
 		CodexSyncedDesktopWindowsBuild:      proxy.CurrentRuntimeSettings().CodexSyncedDesktopWindowsBuild,
 		CodexSyncedVSCodeBuild:              proxy.CurrentRuntimeSettings().CodexSyncedVSCodeBuild,
+		CodexClientVersions:                 proxy.CodexClientVersionCacheView(),
 		CodexEffectiveCLIVersion:            proxy.LatestCodexCLIVersionForHeaders(),
 		SchedulerMode:                       h.store.GetSchedulerMode(),
 		AffinityMode:                        h.store.GetAffinityMode(),
@@ -12210,6 +12280,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexUserAgentConfig:                runtimeCfg.CodexUserAgentConfig,
 		CodexTelemetryEnabled:               runtimeCfg.CodexTelemetryEnabled,
 		CodexTelemetryTimingDebug:           runtimeCfg.CodexTelemetryTimingDebug,
+		CodexUnifiedClientIdentityEnabled:   runtimeCfg.CodexUnifiedClientIdentityEnabled,
 		UsageLogMode:                        usageLogMode,
 		UsageLogBatchSize:                   usageLogBatchSize,
 		UsageLogFlushIntervalSeconds:        usageLogFlushIntervalSeconds,
@@ -12220,6 +12291,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		BillingTierPolicy:                   runtimeCfg.BillingTierPolicy,
 		ModelsListReadMaxBytes:              runtimeCfg.ModelsListReadMaxBytes,
 		ShowFullUsageNumbers:                showFullUsageNumbers,
+		ShowUpstreamModelMismatch:           showUpstreamModelMismatch,
 		PublicKeyUsagePageEnabled:           publicKeyUsagePageEnabled,
 		PublicImageStudioPageEnabled:        publicImageStudioPageEnabled,
 		PublicAccountPortalPageEnabled:      publicAccountPortalPageEnabled,
