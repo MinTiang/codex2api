@@ -1,3 +1,4 @@
+import { intelligenceQuery, type IntelligenceSettings, type IntelligenceAccount, type IntelligenceRun, type IntelligenceBar, type IntelligencePage } from './lib/intelligenceCheck.ts'
 import { qualityTestFilterQuery, type QualityTestJob, type QualityTestJobsFilter, type QualityTestJobsResponse, type QualityTestPrompt } from './lib/qualityTest.ts'
 import type {
   AccountEventTrendPoint,
@@ -28,6 +29,7 @@ import type {
   AntigravityAccountState,
   AntigravityStateSyncResponse,
   AntigravityCapabilityProbeResponse,
+  AntigravityQuotaClearResponse,
   BatchUpdateGrokModelsRequest,
   BatchUpdateGrokModelsResponse,
   FetchGrokModelsResponse,
@@ -190,11 +192,13 @@ type RequestOptions = RequestInit & { timeoutMs?: number }
 
 export class AdminAPIError extends Error {
   readonly status: number
+  readonly details: unknown
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, details?: unknown) {
     super(message)
     this.name = 'AdminAPIError'
     this.status = status
+    this.details = details
   }
 }
 
@@ -258,7 +262,9 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     if (res.status === 401) {
       resetAdminAuthState()
     }
-    throw new AdminAPIError(res.status, extractAdminErrorMessage(body, res.status))
+    let details: unknown
+    try { details = JSON.parse(body) } catch { /* Non-JSON errors retain their message. */ }
+    throw new AdminAPIError(res.status, extractAdminErrorMessage(body, res.status), details)
   }
 
   if (res.status === 204) {
@@ -332,7 +338,7 @@ async function requestAPIKeyUsage<T>(path: string, apiKey: string, options: Requ
 
   if (!res.ok) {
     const body = await res.text()
-    throw new Error(extractAdminErrorMessage(body, res.status))
+    throw new AdminAPIError(res.status, extractAdminErrorMessage(body, res.status))
   }
 
   return (await res.json()) as T
@@ -577,6 +583,8 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
+  getPublicAPIKeyConcurrency: (apiKey: string, options: RequestInit = {}) =>
+    requestAPIKeyUsage<{ current: number }>('/concurrency', apiKey, options),
   getPublicAPIKeyUsage: (apiKey: string, range = '30d', params: { page?: number; pageSize?: number } & PublicAPIKeyUsageLogFilter = {}) => {
     const search = new URLSearchParams()
     search.set('range', range)
@@ -906,6 +914,10 @@ export const api = {
     }),
   refreshAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}/refresh`, { method: 'POST' }),
+  getScheduledConnectionTests: (id: number) =>
+    request<import('./types').ScheduledConnectionTestResponse>(`/accounts/${id}/scheduled-tests`),
+  updateScheduledConnectionTests: (id: number, data: import('./types').ScheduledConnectionTestConfig) =>
+    request<import('./types').ScheduledConnectionTestConfig>(`/accounts/${id}/scheduled-tests`, { method: 'PUT', body: JSON.stringify(data) }),
   getAccount: (id: number, signal?: AbortSignal) =>
     request<AccountRow>(`/accounts/${id}`, { signal }),
   forceUsageProbe: () =>
@@ -1051,10 +1063,24 @@ export const api = {
       body: JSON.stringify({ channels }),
     }),
   getAntigravitySettings: () => request<AntigravitySettingsResponse>('/settings/antigravity'),
-  updateAntigravitySettings: (patch: { model_redirects?: Record<string, string>; redirect_overrides_effort?: boolean; expose_thoughts?: boolean }) =>
+  updateAntigravitySettings: (patch: {
+    model_redirects?: Record<string, string>
+    redirect_overrides_effort?: boolean
+    expose_thoughts?: boolean
+    quota_refresh_enabled?: boolean
+    quota_refresh_interval_minutes?: number
+    quota_gate_enabled?: boolean
+    expiry_priority_enabled?: boolean
+    expiry_priority_horizon_hours?: number
+  }) =>
     request<AntigravitySettingsResponse>('/settings/antigravity', {
       method: 'PUT',
       body: JSON.stringify(patch),
+    }),
+  clearAntigravityQuota: (ids: number[]) =>
+    request<AntigravityQuotaClearResponse>('/accounts/antigravity/quota/clear', {
+      method: 'POST',
+      body: JSON.stringify({ account_ids: ids }),
     }),
   getChannelTestSettings: () => request<ChannelTestSettingsResponse>('/settings/channel-tests'),
   updateChannelTestSettings: (patch: Partial<Record<'antigravity' | 'claude', Partial<ChannelTestSettings>>>) =>
@@ -1520,6 +1546,14 @@ export const api = {
   dismissPromptIntelligenceCandidate: (id: number) =>
     request<import('./types').PromptIntelligenceCandidate>(`/prompt-filter/intelligence/candidates/${id}/dismiss`, { method: 'POST' }),
   getModels: () => request<ModelsResponse>('/models'),
+  getIntelligenceSettings: (signal?: AbortSignal) => request<IntelligenceSettings>('/intelligence-check/settings', { signal }),
+  saveIntelligenceSettings: (body: IntelligenceSettings) => request<IntelligenceSettings>('/intelligence-check/settings', { method: 'PUT', body: JSON.stringify(body) }),
+  getIntelligenceAccounts: (page = 1, filters: Record<string, string | number | undefined> = {}, signal?: AbortSignal) => request<IntelligencePage<IntelligenceAccount>>(`/intelligence-check/accounts?${intelligenceQuery(page, filters)}`, { signal }),
+  setIntelligenceAccounts: (account_ids: number[], enabled: boolean) => request<{ updated: number }>('/intelligence-check/accounts', { method: 'PATCH', body: JSON.stringify({ account_ids, enabled }) }),
+  createIntelligenceRuns: (account_ids: number[]) => request<{ runs: IntelligenceRun[] }>('/intelligence-check/runs', { method: 'POST', body: JSON.stringify({ account_ids }) }),
+  getIntelligenceRuns: (page = 1, filters: Record<string, string | number | undefined> = {}, signal?: AbortSignal) => request<IntelligencePage<IntelligenceRun>>(`/intelligence-check/runs?${intelligenceQuery(page, filters)}`, { signal }),
+  getIntelligenceRun: (id: number, signal?: AbortSignal) => request<{ run: IntelligenceRun }>(`/intelligence-check/runs/${id}`, { signal }),
+  getIntelligenceBars: (ids: number[], signal?: AbortSignal) => request<{ bars: Record<string, IntelligenceBar> }>(`/intelligence-check/bars?account_ids=${ids.join(',')}`, { signal }),
   getQualityTestOptions: (id: number, signal?: AbortSignal) =>
     request<{ models: string[]; reasoning_efforts: string[] }>(`/accounts/${id}/quality-test/options`, { signal }),
   getQualityTestPrompts: (signal?: AbortSignal) =>
@@ -1561,6 +1595,7 @@ export const api = {
       sync_url: string
       default_sync_url: string
       models_dev_url: string
+      litellm_url: string
 		official_openai_url: string
 		official_xai_url: string
 		official_claude_url: string

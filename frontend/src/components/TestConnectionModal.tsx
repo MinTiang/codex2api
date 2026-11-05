@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   Activity,
+  CalendarClock,
   CheckCircle,
   ChevronDown,
   CircleAlert,
@@ -37,12 +38,13 @@ import {
   isConnectionTestModel,
   uniqueTestModels,
 } from "../lib/connectionTestModels";
-import { orderAntigravityTestModels } from "../lib/antigravityModels";
+import { isAntigravityDisabledModel, orderAntigravityTestModels, resolveAntigravityTestModelSelection } from "../lib/antigravityModels";
 import { grokConnectionTestModels } from "../lib/grokModelDisplay";
 import { cn } from "@/lib/utils";
 import { useToast } from "../hooks/useToast";
 import Modal from "./Modal";
 import ModelDetectorModal from "./ModelDetectorModal";
+import ScheduledConnectionTestsModal from "./ScheduledConnectionTestsModal";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/select";
@@ -114,6 +116,7 @@ export default function TestConnectionModal({
   const [headersOpen, setHeadersOpen] = useState(false);
   const [rawOpen, setRawOpen] = useState(false);
   const [detectorOpen, setDetectorOpen] = useState(false);
+  const [activationOpen, setActivationOpen] = useState(false);
   const [testContent, setTestContent] = useState("hi");
   // 跨重测保留:同步后自动重测仍被拒时,据此提示"已同步仍失败"而不是再次引导同步。
   const [versionSync, setVersionSync] = useState<{
@@ -152,7 +155,10 @@ export default function TestConnectionModal({
         modelOptions,
         isAntigravityAccount && !modelOptions.includes(selectedModel) ? undefined : selectedModel,
         !isOpenAIResponsesAccount && !isClaudeAccount && !isAntigravityAccount,
-      ).map((item) => ({ label: item, value: item })),
+      ).filter((item) => !isAntigravityAccount || !isAntigravityDisabledModel(item)).map((item) => ({
+        label: item,
+        value: item,
+      })),
     [isAntigravityAccount, isClaudeAccount, isOpenAIResponsesAccount, modelOptions, selectedModel],
   );
 
@@ -174,7 +180,7 @@ export default function TestConnectionModal({
           if (!active) return;
           const ordered = orderAntigravityTestModels(account.models ?? [], preferred, account.antigravity_quota);
           setModelOptions(ordered);
-          setSelectedModel((current) => ordered.includes(current) ? current : ordered[0] || "");
+          setSelectedModel((current) => resolveAntigravityTestModelSelection(ordered, current));
           return;
         }
 
@@ -253,7 +259,7 @@ export default function TestConnectionModal({
         if (isAntigravityAccount) {
           const ordered = orderAntigravityTestModels(account.models ?? [], "", account.antigravity_quota);
           setModelOptions(ordered);
-          setSelectedModel((current) => ordered.includes(current) ? current : ordered[0] || "");
+          setSelectedModel((current) => resolveAntigravityTestModelSelection(ordered, current));
         } else if (isClaudeAccount) {
           const accountModels = (account.models ?? []).filter(
             (model) => isConnectionTestModel(model) && model.toLowerCase().startsWith("claude-"),
@@ -660,6 +666,12 @@ export default function TestConnectionModal({
                 {t("accounts.detectorOpen")}
               </Button>
             ) : null}
+            {!restoreOnSuccess && (isCodexOAuthAccount || Boolean(account.openai_responses_api)) ? (
+              <Button type="button" variant="ghost" size="sm" disabled={running || !modelOptionsReady || !selectedModel} onClick={() => setActivationOpen(true)}>
+                <CalendarClock className="size-3.5" />
+                {t("accounts.activationTitle")}
+              </Button>
+            ) : null}
           </div>
           <Button
             variant="outline"
@@ -1012,6 +1024,9 @@ export default function TestConnectionModal({
         )}
       </div>
     </Modal>
+    {activationOpen ? (
+      <ScheduledConnectionTestsModal account={account} models={modelSelectOptions.map((option) => option.value)} defaultModel={selectedModel} defaultContent={testContent} onClose={() => setActivationOpen(false)} />
+    ) : null}
     {detectorOpen ? (
       <ModelDetectorModal
         account={account}

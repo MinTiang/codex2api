@@ -2,7 +2,6 @@ package admin
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"net/http"
 	"strconv"
@@ -17,6 +16,7 @@ import (
 const (
 	publicAPIKeyUsageDefaultLogPageSize = 25
 	publicAPIKeyUsageMaxLogPageSize     = 100
+	publicAPIKeyUsageTimeout            = 8 * time.Second
 )
 
 type publicAPIKeyUsageResponse struct {
@@ -47,22 +47,10 @@ type publicAPIKeyUsageRange struct {
 }
 
 func (h *Handler) GetPublicAPIKeyUsageSummary(c *gin.Context) {
-	if h == nil || h.db == nil {
-		writeError(c, http.StatusServiceUnavailable, "服务未就绪")
-		return
-	}
-	enabled, err := h.PublicAPIKeyUsagePageEnabled(c.Request.Context())
-	if err != nil {
-		writeInternalError(c, err)
-		return
-	}
-	if !enabled {
-		writeError(c, http.StatusNotFound, "API Key 自助用量页未启用")
-		return
-	}
-	key := extractPublicAPIKey(c)
-	if key == "" {
-		writeError(c, http.StatusUnauthorized, "缺少 Authorization Bearer API Key")
+	ctx, cancel := context.WithTimeout(c.Request.Context(), publicAPIKeyUsageTimeout)
+	defer cancel()
+	row := h.publicAPIKeyUsageRow(c, ctx)
+	if row == nil {
 		return
 	}
 
@@ -79,20 +67,6 @@ func (h *Handler) GetPublicAPIKeyUsageSummary(c *gin.Context) {
 	logFilter, err := parsePublicAPIKeyUsageLogFilter(c.Query("model"), c.Query("endpoint"), c.Query("status"), c.Query("stream"), c.Query("channel"))
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 8*time.Second)
-	defer cancel()
-
-	row, err := h.db.GetAPIKeyByValue(ctx, key)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			security.SecurityAuditLog("KEY_USAGE_AUTH_FAILED", "ip="+security.SanitizeLog(c.ClientIP())+" key="+security.MaskAPIKey(key))
-			writeError(c, http.StatusUnauthorized, "API Key 无效或不存在")
-			return
-		}
-		writeInternalError(c, err)
 		return
 	}
 
@@ -158,6 +132,9 @@ func parsePublicAPIKeyUsageLogPagination(pageRaw, pageSizeRaw string) (int, int,
 		parsed, err := strconv.Atoi(pageRaw)
 		if err != nil || parsed < 1 {
 			return 0, 0, errors.New("page 参数无效，需要正整数")
+		}
+		if parsed > maxAdminPage {
+			return 0, 0, errors.New("page 参数过大")
 		}
 		page = parsed
 	}

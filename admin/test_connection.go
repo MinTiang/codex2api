@@ -24,6 +24,8 @@ import (
 var batchTestAccountTimeout = 30 * time.Second
 var batchTestWhamTimeout = 5 * time.Second
 
+var errAntigravityNoEnabledTestModel = errors.New("该 Antigravity 账号暂无可自动测试的模型，请手动选择禁用模型进行测试")
+
 // testEvent SSE 测试事件
 type testEvent struct {
 	Type    string `json:"type"`              // test_start | content | diagnostics | test_complete | error
@@ -174,6 +176,15 @@ func (h *Handler) testConnection(c *gin.Context, quality *qualityTestRequest) {
 
 	// 探针本身也进用量记录:测连 / 降智检测各有独立内部原因,用量页据此打标。
 	usageReason := connectionTestReason(quality)
+	if c.GetBool(scheduledTestContextKey) {
+		usageReason = "scheduled_connection_test"
+		if !isClaudeAccount && !isAntigravityAccount && !isOpenAIResponsesAccount {
+			// Codex Responses models do not all expose the same reasoning tiers.
+			// `none` is the lowest-cost tier supported by gpt-6-luna and avoids
+			// sending the unsupported `minimal` value to the upstream API.
+			payload, _ = sjson.SetBytes(payload, "reasoning.effort", "none")
+		}
+	}
 	usageEndpoint := connectionTestEndpoint(account)
 	usageEffort := connectionTestReasoningEffort(payload)
 
@@ -212,8 +223,8 @@ func (h *Handler) testConnection(c *gin.Context, quality *qualityTestRequest) {
 		resp, reqErr = h.executeAntigravityConnectionTest(c.Request.Context(), account, testModel, payload, h.store.ResolveProxyForAccount(account), !isTransient)
 	} else if isOpenAIResponsesAccount {
 		resp, reqErr = proxy.ExecuteRelayStyleRequest(c.Request.Context(), account, payload, h.store.ResolveProxyForAccount(account), nil)
-	} else if quality != nil {
-		// 降智检测是一次性长生成(常达数分钟),不需要 WS 续链;强制走独立 HTTP SSE,
+	} else if quality != nil || c.GetBool(scheduledTestContextKey) {
+		// 降智检测和定时激活均使用独立 HTTP SSE，不依赖 WS 续链或重连；
 		// 不受"强制 WebSocket"影响,也不占用/依赖池化长连接。
 		resp, reqErr = proxy.ExecuteRequest(c.Request.Context(), account, payload, "", h.store.ResolveProxyForAccount(account), "", nil, nil, false)
 	} else {
@@ -1083,14 +1094,14 @@ func isTextConnectionModel(model string) bool {
 	return model != "" && !strings.Contains(model, "image")
 }
 
-// antigravityConnectionTestModels 是 Antigravity 账号可用于测连的文本模型：
-// 把账号同步到的 wire 目录（或安全默认集）投影成对外发布的固定档位 ID，
-// 与账号页下拉、/v1/models 暴露的是同一份真相。
+// antigravityConnectionTestModels projects the account's catalog for explicit
+// admin tests. Disabled placeholders keep their original ID here, while normal
+// inference and automatic test selection continue to exclude them.
 func antigravityConnectionTestModels(account *auth.Account) []string {
 	if account == nil {
 		return nil
 	}
-	published := proxy.AntigravityPublishedModelIDs(account.AntigravityModels())
+	published := proxy.AntigravityAdminModelIDs(account.AntigravityModels())
 	models := make([]string, 0, len(published))
 	for _, model := range published {
 		if isTextConnectionModel(model) {
@@ -1117,6 +1128,16 @@ func antigravityConnectionTestModel(account *auth.Account, requested string, def
 			}
 		}
 		return "", fmt.Errorf("该 Antigravity 账号不支持测试模型: %s", requested)
+	}
+	enabled := models[:0]
+	for _, model := range models {
+		if !proxy.AntigravityDisabledModel(model) {
+			enabled = append(enabled, model)
+		}
+	}
+	models = enabled
+	if len(models) == 0 {
+		return "", errAntigravityNoEnabledTestModel
 	}
 	for _, defaultModel := range defaultModels {
 		defaultModel = strings.TrimSpace(defaultModel)
@@ -1187,6 +1208,16 @@ func antigravityModelVersion(model string) float64 {
 // 与调度路径一致：OAuth 号收到 401 先用 RT 换一次 AT 再重试一次，避免仅因
 // AT 过期就把号标成未授权；allowRefresh=false（回收站临时账号）不回写凭据。
 func (h *Handler) executeAntigravityConnectionTest(ctx context.Context, account *auth.Account, model string, payload []byte, proxyURL string, allowRefresh bool) (*http.Response, error) {
+	validateDisabledModel := func() error {
+		if proxy.AntigravityDisabledModel(model) {
+			_, err := antigravityConnectionTestModel(account, model)
+			return err
+		}
+		return nil
+	}
+	if err := validateDisabledModel(); err != nil {
+		return nil, err
+	}
 	execute := h.antigravityProbeExecutor()
 	resp, err := execute(ctx, account, model, payload, true, proxyURL)
 	if err != nil || resp == nil {
@@ -1202,6 +1233,11 @@ func (h *Handler) executeAntigravityConnectionTest(ctx context.Context, account 
 	}
 	if resp.Body != nil {
 		_ = resp.Body.Close()
+	}
+	// Refresh may replace the catalog as well as the token. Do not retry a
+	// disabled placeholder that is no longer owned by this account.
+	if err := validateDisabledModel(); err != nil {
+		return nil, err
 	}
 	return execute(ctx, account, model, payload, true, proxyURL)
 }
@@ -1629,7 +1665,9 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 		if msg, ok := batchTestContextFailure(testCtx, modelErr); ok {
 			return "failed", msg
 		}
-		h.store.MarkError(acc, "批量测试失败: "+modelErr.Error())
+		if !errors.Is(modelErr, errAntigravityNoEnabledTestModel) {
+			h.store.MarkError(acc, "批量测试失败: "+modelErr.Error())
+		}
 		return "failed", modelErr.Error()
 	}
 	securityCfg := h.store.ClaudeSecurityConfig()

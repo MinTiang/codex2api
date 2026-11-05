@@ -1,3 +1,6 @@
+import { useIntelligenceBars } from "../hooks/useIntelligenceBars";
+import AccountIntelligenceBar, { AccountIntelligenceActions } from "../components/AccountIntelligenceBar";
+import type { IntelligenceBar } from "../lib/intelligenceCheck";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, ReactNode } from "react";
 import { useTranslation } from "react-i18next";
@@ -73,6 +76,11 @@ import {
 } from "../lib/accountProxyBinding";
 import ChipInput from "../components/ChipInput";
 import { formatCustomHeadersText, parseCustomHeadersText } from "../lib/accountQuickConfig";
+import {
+  autoPauseThresholdPercentToRatio,
+  formatAutoPauseThresholdPercent,
+  isAutoPauseThresholdPercentInvalid,
+} from "../lib/autoPauseThreshold";
 import { AccountGroupManagerModal, ACCOUNT_GROUP_COLORS } from "../components/AccountGroupManagerModal";
 import { Select } from "../components/ui/select";
 import ChannelLogo from "../components/ChannelLogo";
@@ -573,7 +581,7 @@ function ClaudeConcurrencyBadge({ acc }: { acc: AccountRow }) {
   const showOccupied = acc.session_slot_buffer_enabled === true;
   return (
     <span
-      className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-blue-700 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-300"
+      className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-md bg-blue-50 px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-blue-700 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-300"
       title={showOccupied
         ? t("accounts.occupiedRequestsTooltip", { active, occupied, buffered })
         : t("accounts.activeRequestsTooltip", { count: active })}
@@ -1075,6 +1083,8 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
     },
     [reload, showToast],
   );
+
+  const { bars: intelligenceBars, error: intelligenceBarsError } = useIntelligenceBars(accountIDsKey, pageStatsToken);
 
   // 健康状态条数据。
   useEffect(() => {
@@ -1981,6 +1991,8 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
                       onToggleSelect={() => toggleSelect(acc.id)}
                       groupMap={groupMap}
                       healthBuckets={healthBars[String(acc.id)]}
+                      intelligenceBar={intelligenceBars[String(acc.id)]}
+                      intelligenceError={intelligenceBarsError}
                       showDomainTags={!hideDomainTags}
                       columns={visibleCols}
                       proxyCtx={proxyBindingCtx}
@@ -2116,6 +2128,8 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
           account={detailTarget}
           groups={(detailTarget.group_ids ?? []).map((id) => groupMap.get(id)).filter(Boolean) as AccountGroup[]}
           healthBuckets={healthBars[String(detailTarget.id)]}
+          intelligenceBar={intelligenceBars[String(detailTarget.id)]}
+          intelligenceError={intelligenceBarsError}
           usageSlot={detailTarget.claude_auth_kind === "api_key" ? <p className="text-xs text-muted-foreground">{t("claude.apiKeyUsageNA")}</p> :
             <div className="space-y-1.5 rounded-xl border border-border bg-card p-3">
               <UsageWindow label={t("claude.usage5h")} pct={claudeUsagePct(detailTarget.usage_percent_5h)} reset={detailTarget.reset_5h_at} detail={detailTarget.usage_5h_detail} />
@@ -2223,6 +2237,8 @@ function ClaudeAccountRow({
   onToggleSelect,
   groupMap,
   healthBuckets,
+  intelligenceBar,
+  intelligenceError,
   showDomainTags,
   columns,
   proxyCtx,
@@ -2250,6 +2266,8 @@ function ClaudeAccountRow({
   onToggleSelect: () => void;
   groupMap: Map<number, AccountGroup>;
   healthBuckets?: AccountHealthBucket[];
+  intelligenceBar?: IntelligenceBar;
+  intelligenceError?: boolean;
   showDomainTags: boolean;
   columns: ClaudeColVisibility;
   proxyCtx: ProxyBindingContext;
@@ -2501,14 +2519,18 @@ function ClaudeAccountRow({
         <TableCell data-account-state-cell="status">
           {tableOverlay ?? (
             <div className="min-w-[168px] max-w-[240px] space-y-1.5">
-              <div className="flex min-h-6 flex-wrap items-center gap-1.5">
-                <StatusBadge status={getAccountStatusBadgeStatus(acc)} errorMessage={acc.error_message} detail={cooldownReason} />
+              <div className="flex min-h-6 flex-nowrap items-center gap-1.5 whitespace-nowrap">
+                <div className="inline-flex shrink-0 items-center gap-1.5">
+                  <StatusBadge status={getAccountStatusBadgeStatus(acc)} errorMessage={acc.error_message} detail={cooldownReason} />
+                  <AccountIntelligenceActions bar={intelligenceBar} accountID={acc.id} accountName={acc.email || acc.name} />
+                </div>
                 <LiveCountdown until={acc.cooldown_until} label={t("claude.resetIn")} />
                 <ClaudeConcurrencyBadge acc={acc} />
               </div>
               {/* 采样状态与最后采样时间合成一行:状态点 + 文案 + 相对时间,错误信息放 title */}
               {acc.claude_api && !isAPIKey ? <ClaudeSampleStateLine acc={acc} /> : null}
               <AccountHealthBar buckets={healthBuckets} />
+              <AccountIntelligenceBar bar={intelligenceBar} accountID={acc.id} accountName={acc.email || acc.name} error={intelligenceError} />
             </div>
           )}
         </TableCell>
@@ -2964,12 +2986,9 @@ function EditAccountModal({
   const [concurrency, setConcurrency] = useState(
     account.base_concurrency_override != null ? String(account.base_concurrency_override) : "",
   );
-  const [pause5h, setPause5h] = useState(
-    account.auto_pause_5h_threshold != null ? String(account.auto_pause_5h_threshold) : "",
-  );
-  const [pause7d, setPause7d] = useState(
-    account.auto_pause_7d_threshold != null ? String(account.auto_pause_7d_threshold) : "",
-  );
+  // 自动暂停阈值后端存 0..1 比例,输入框按百分比展示/输入(issue #843)。
+  const [pause5h, setPause5h] = useState(() => formatAutoPauseThresholdPercent(account.auto_pause_5h_threshold));
+  const [pause7d, setPause7d] = useState(() => formatAutoPauseThresholdPercent(account.auto_pause_7d_threshold));
   const [fpMode, setFpMode] = useState<"" | "preserve" | "force">(
     (account.claude_fingerprint_mode as "" | "preserve" | "force") ?? "",
   );
@@ -3026,6 +3045,10 @@ function EditAccountModal({
       }
       apiKeyCustomHeaders = parsed.value;
     }
+    if (!isAPIKeyAccount && (isAutoPauseThresholdPercentInvalid(pause5h) || isAutoPauseThresholdPercentInvalid(pause7d))) {
+      showToast(t("accounts.autoPauseThresholdRange"), "error");
+      return;
+    }
     setBusy(true);
     try {
       await api.updateAccountScheduler(account.id, {
@@ -3035,8 +3058,8 @@ function EditAccountModal({
         score_bias_override: parseNum(scoreBias),
         base_concurrency_override: parseNum(concurrency),
         ...(!isAPIKeyAccount ? {
-        auto_pause_5h_threshold: parseNum(pause5h),
-        auto_pause_7d_threshold: parseNum(pause7d),
+        auto_pause_5h_threshold: autoPauseThresholdPercentToRatio(pause5h),
+        auto_pause_7d_threshold: autoPauseThresholdPercentToRatio(pause7d),
         claude_fingerprint_mode: fpMode,
         claude_client_platform: clientPlatform || null,
         claude_version_policy: versionPolicy || null,
@@ -3235,8 +3258,8 @@ function EditAccountModal({
             {t("claude.editSectionAutoPause")}
           </div>
           <div className="grid grid-cols-2 gap-3">
-            {field(t("claude.autoPause5hLabel"), <Input value={pause5h} onChange={(e) => setPause5h(e.target.value)} placeholder="90" inputMode="numeric" />)}
-            {field(t("claude.autoPause7dLabel"), <Input value={pause7d} onChange={(e) => setPause7d(e.target.value)} placeholder="90" inputMode="numeric" />)}
+            {field(t("claude.autoPause5hLabel"), <Input value={pause5h} onChange={(e) => setPause5h(e.target.value)} placeholder="90" inputMode="decimal" />)}
+            {field(t("claude.autoPause7dLabel"), <Input value={pause7d} onChange={(e) => setPause7d(e.target.value)} placeholder="90" inputMode="decimal" />)}
           </div>
         </div>
 

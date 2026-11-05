@@ -301,7 +301,7 @@
     "exportAll": "匯出憑據",
     "exportOne": "匯出此憑據",
     "exporting": "正在匯出...",
-    "exportSuccess": "已匯出 {{count}} 份含密鑰的憑據檔案",
+    "exportSuccess": "已匯出 {{count}} 個帳號的憑據（單個 JSON 檔案，含密鑰）",
     "exportSuccessUnknownCount": "Antigravity 憑據已匯出",
     "exportFailed": "憑據匯出失敗：{{error}}",
     "exportAllConfirmTitle": "匯出全部 Antigravity 憑據？",
@@ -352,6 +352,25 @@
     }
   },
   "accounts": {
+    "activationTitle": "定時啟用",
+    "activationEnabled": "啟用定時測試",
+    "activationTimezone": "時區：Asia/Shanghai（北京時間）",
+    "activationSaved": "定時測試計畫已儲存",
+    "activationUnsaved": "有未儲存的修改",
+    "activationSaveHint": "儲存後依計畫自動執行",
+    "activationWeekdays": "工作日 · 週一至週五",
+    "activationWeekends": "週末 · 週六、週日",
+    "activationAdd": "新增",
+    "activationRemove": "刪除 {{time}}",
+    "activationNoTimes": "尚未新增時間點",
+    "activationExecutionHint": "每個時間點使用目前帳號、所選模型和測試內容傳送一次請求，會消耗該帳號額度。失敗不重試、不換號；關閉頁面後仍由伺服器執行。停用帳號或關閉開關後停止後續計畫，錯過的時間點不補發。",
+    "activationRecords": "最近執行記錄",
+    "activationNoRecords": "尚無執行記錄；儲存計畫不會立即傳送請求。",
+    "activationReset": "下次 5 小時重設",
+    "activationStatus_success": "成功",
+    "activationStatus_failed": "失敗",
+    "activationStatus_skipped": "已略過",
+    "activationStatus_unknown": "結果未確認",
     "refreshAllUsage": "一鍵重新整理用量",
     "refreshAllUsageHint": "查詢執行池中所有支援 WHAM 的 Codex 帳號，更新 5 小時和週用量進度條。",
     "batchUsageRefreshing": "正在重新整理用量",
@@ -534,6 +553,8 @@
     "hrefClickHint": "點擊開啟跳轉位址（未設定時開啟 api-base）；Alt/Option+點擊 設定自訂連結"
   },
   "settings": {
+    "schedulerModeReset5hFirst": "5 小時即將重置優先",
+    "schedulerModeReset5hFirstDesc": "在相同調度優先級與健康檔位內，優先使用 5 小時窗口最早重置且仍有額度的 Codex 帳號；額度耗盡、限流、無權限或併發已滿時順延。以已觀測的重置時間為準，過期、未知或不適用的窗口沿用原有調度。不自動啟用帳號、不推算下個週期。保留既有會話綁定；新會話首次選號優先於親和雜湊。週限額與現有安全限制繼續生效。",
     "codexClientVersions": {
       "platform": "用戶端 / 平台",
       "pair": "應用程式 / 內建 CLI",
@@ -669,6 +690,8 @@
     "modelCooldownSecondsDesc": "範圍 1–1800 秒。",
     "modelCooldownBackoff": "指數退避",
     "modelCooldownBackoffDesc": "僅自適應模式生效。",
+    "unsupportedModelCooldownSeconds": "不支援模型冷卻",
+    "unsupportedModelCooldownSecondsDesc": "上游回傳「model is not supported when using Codex with a ChatGPT account」時，該帳號在此時長內不再調度這個模型，不影響其他模型與帳號健康度。0 表示關閉（同一請求內仍會換號重試）；調小或關閉時會自動清除超出新時長的既有冷卻。混用免費/付費帳號時，建議在帳號詳情設定支援模型白名單。",
     "sessionSlotBuffer": "會話並發槽緩衝",
     "sessionSlotBufferDesc": "成功請求結束後，為原會話短暫保留帳號並發槽；同一會話可立即取回，其他新會話不能搶佔。失敗和重試仍立即釋放，正在執行的請求不會中斷。每次都產生新親和鍵的短請求也會佔用到期，因此緩衝時間越長，吞吐下降越明顯。預設關閉。",
     "sessionSlotBufferSeconds": "緩衝時間（秒）",
@@ -1675,6 +1698,8 @@
     "cyberRiskSubjectEvents": "{{count}} 筆事件"
   },
   "usage": {
+    "internalScheduledActivation": "定時啟用",
+    "internalScheduledActivationTooltip": "伺服器依目前帳號儲存的計畫傳送的連線測試請求",
     "usageAnalysis": "用量分析",
     "modelStatsDesc": "主要模型的請求、Token 與金額分布。",
     "modelStatsScope": "占比依金額排名前 10 的模型計算。",
@@ -2183,5 +2208,27 @@
       "6": "週六",
       "7": "週日"
     }
+  },
+  "antigravityQuota": {
+    "cardTitle": "配額自動重新整理與門禁",
+    "cardDescription": "週期性拉取 Antigravity 帳號的上游配額事實，用於排程選擇與硬門禁判定。",
+    "refreshEnabled": "自動重新整理配額",
+    "refreshEnabledHint": "依固定間隔向上游查詢各帳號配額事實。",
+    "gateEnabled": "配額硬門禁",
+    "gateEnabledHint": "開啟後配額耗盡的帳號將直接被攔截並回傳 429，不再進入排隊。",
+    "refreshInterval": "重新整理間隔（分鐘）",
+    "refreshIntervalHint": "允許範圍 3–60 分鐘；儲存後本機立即重排，跨複本經 outbox ≤5 秒生效。",
+    "expiryPriority": "臨期優先排程",
+    "expiryPriorityHint": "開啟後，新工作階段優先分給請求模型所在配額族（Gemini / Claude+GPT / Argon）週配額即將重置且仍有存量的帳號，減少到期清零浪費；僅在 round_robin 排程模式下生效。",
+    "expiryHorizon": "臨期時間窗（小時）",
+    "expiryHorizonHint": "週配額距重置不超過該時長、剩餘 ≥5% 的帳號視為臨期，允許範圍 1–168 小時。",
+    "hint": "關閉僅停止自動配額查詢，模型目錄維護仍獨立",
+    "saved": "配額設定已儲存",
+    "clearAction": "清除配額事實",
+    "clearTitle": "清除配額事實",
+    "clearConfirm": "確認要清除選取帳號的配額事實嗎？該操作將刪除已儲存的配額事實並遞增配額紀元，用於誤封止血；不影響憑證與模型目錄。",
+    "clearDone": "已清除 {{cleared}} 個帳號的配額事實",
+    "clearPartial": "已清除 {{cleared}} 個帳號的配額事實，{{failed}} 個失敗",
+    "clearFailed": "清除配額事實失敗：{{error}}"
   }
 }
